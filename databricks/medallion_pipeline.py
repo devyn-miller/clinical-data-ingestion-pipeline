@@ -3,6 +3,8 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -20,7 +22,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# Custom exception for pipeline failures.
+# Custom exception for pipeline failures
 class PipelineExecutionError(Exception):
     """Raised when a Medallion layer (Bronze/Silver/Gold) fails to complete."""
 
@@ -29,40 +31,89 @@ def _s3_join(*parts: str) -> str:
     return "/".join(p.strip("/") for p in parts if p)
 
 def _get_spark_session() -> SparkSession:
-    """Retrieve the active SparkSession regardless of context."""
+    """Retrieve the active SparkSession or bootstrap an isolated local session."""
     session = SparkSession.getActiveSession()
     if session is None:
-        raise PipelineExecutionError(
-            "No active SparkSession found. "
-            "In Databricks this means the cluster has not initialized yet. "
-            "Locally, bootstrap a session before calling run_pipeline()."
+        log.info("No active SparkSession found — bootstrapping a new local session.")
+        session = (
+            SparkSession.builder.appName("choc_rady_medallion_pipeline")
+            .master("local[*]")
+            .config("spark.sql.shuffle.partitions", "4")
+            .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+            .config("spark.driver.memory", "2g")
+            .getOrCreate()
         )
+        session.sparkContext.setLogLevel("WARN")
     return session
 
+AWS_ACCESS_KEY_ID = "PASTE_YOUR_AWS_ACCESS_KEY_ID_HERE"
+AWS_SECRET_ACCESS_KEY = "PASTE_YOUR_AWS_SECRET_ACCESS_KEY_HERE"
+AWS_SESSION_TOKEN = None
 
-S3_ROOT: str = os.getenv("S3_ROOT", "s3://choc-rady-clinical-bronze-demo")
-BRONZE_INPUT_BASE: str = os.getenv("BRONZE_INPUT_BASE", S3_ROOT)
-BRONZE_OUTPUT_BASE: str = os.getenv("BRONZE_OUTPUT_BASE", S3_ROOT)
-SILVER_OUTPUT_BASE: str = os.getenv(
-    "SILVER_OUTPUT_BASE",
-    f"{S3_ROOT.rstrip('/')}/silver",
-)
-GOLD_OUTPUT_BASE: str = os.getenv(
-    "GOLD_OUTPUT_BASE",
-    f"{S3_ROOT.rstrip('/')}/gold",
-)
+# Directory & Path Parameters
+AWS_BUCKET_NAME = "choc-rady-clinical-bronze-demo"
+RAW_PREFIX = "raw"
+LOCAL_DATA_DIR = "data"
 
-METADATA_PATH: str = f"{BRONZE_INPUT_BASE.rstrip('/')}/raw/metadata.csv"
-DICOM_PATH: str = f"{BRONZE_INPUT_BASE.rstrip('/')}/raw/dicom_manifest.csv"
+# Setup local paths for the cluster execution
+METADATA_PATH: str = os.path.join(LOCAL_DATA_DIR, "metadata.csv")
+DICOM_PATH: str = os.path.join(LOCAL_DATA_DIR, "dicom_manifest.csv")
 
+BRONZE_OUTPUT_BASE: str = "output"
+SILVER_OUTPUT_BASE: str = "output/silver"
+GOLD_OUTPUT_BASE: str = "output/gold"
 PIPELINE_RUN_TS: str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 PIPELINE_RUN_DATE: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 log.info("Pipeline run timestamp: %s", PIPELINE_RUN_TS)
-log.info("Bronze input base: %s", BRONZE_INPUT_BASE)
-log.info("Silver output base: %s", SILVER_OUTPUT_BASE)
-log.info("Gold output base: %s", GOLD_OUTPUT_BASE)
+log.info("Local storage destination: %s", LOCAL_DATA_DIR)
 
+def sync_s3_to_local_workspace():
+    """
+    Connects to the AWS Bronze bucket via Boto3, downloads the newest raw clinical
+    uploads, and stages them locally in the cluster workspace.
+    """
+    if AWS_ACCESS_KEY_ID == "PASTE_YOUR_AWS_ACCESS_KEY_ID_HERE" or not AWS_ACCESS_KEY_ID:
+        log.info("[S3 SYNC] No AWS credentials entered in CELL 0. Skipping cloud sync and using local data cache.")
+        return
+
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        aws_session_token=AWS_SESSION_TOKEN
+    )
+
+    log.info("[S3 SYNC] Scanning S3 Bucket '%s' under prefix '%s/'...", AWS_BUCKET_NAME, RAW_PREFIX)
+
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=AWS_BUCKET_NAME, Prefix=RAW_PREFIX)
+        
+        downloaded = 0
+        for page in pages:
+            for obj in page.get("Contents", []):
+                s3_key = obj["Key"]
+                if s3_key.endswith("/"):
+                    continue
+                
+                filename = os.path.basename(s3_key)
+                local_dest_path = os.path.join(LOCAL_DATA_DIR, filename)
+                
+                log.info("[S3 SYNC] Syncing s3://%s/%s ──> %s", AWS_BUCKET_NAME, s3_key, local_dest_path)
+                s3_client.download_file(AWS_BUCKET_NAME, s3_key, local_dest_path)
+                downloaded += 1
+                
+        if downloaded > 0:
+            log.info("[S3 SYNC] Sync complete. Staged %d clinical files to active workspace.", downloaded)
+        else:
+            log.warning("[S3 SYNC] S3 Scan finished but no clinical files were found in the bucket.")
+            
+    except (NoCredentialsError, ClientError) as exc:
+        log.error("[S3 SYNC] S3 Access failed: %s", exc)
+        raise PipelineExecutionError(f"Failed to pull files from AWS S3: {exc}")
 
 
 METADATA_RAW_SCHEMA = StructType(
@@ -137,6 +188,16 @@ def ingest_bronze(
     return bronze_df
 
 
+def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
+    """Return the first path that exists, fallback to alternatives locally."""
+    if os.path.exists(primary):
+        return primary
+    for d in fallback_dirs:
+        candidate = os.path.join(d, os.path.basename(primary))
+        if os.path.exists(candidate):
+            log.info("Source resolved via fallback: %s → %s", primary, candidate)
+            return candidate
+    return primary
 
 DIRTY_LESION_VALUES = {"-1", "NA", "na", "N/A", "n/a", "none", "None", ""}
 POSITIVE_LESION_VALUES = {"1", "positive", "Positive", "POSITIVE"}
@@ -283,10 +344,13 @@ GOLD_COLUMN_ORDER = [
 
 
 def run_pipeline() -> dict:
-    """Execute the full Bronze → Silver → Gold pipeline and return run metrics."""
+    """Execute S3 Cloud Sync, and run the full Medallion pipeline end-to-end."""
     log.info("=" * 70)
     log.info("PIPELINE RUN START — %s", PIPELINE_RUN_TS)
     log.info("=" * 70)
+
+    # 1. Trigger the integrated, Serverless-safe AWS S3 Sync
+    sync_s3_to_local_workspace()
 
     metrics: dict = {"run_timestamp": PIPELINE_RUN_TS}
 
@@ -294,14 +358,17 @@ def run_pipeline() -> dict:
     log.info("BRONZE LAYER — BEGIN")
     log.info("=" * 70)
     try:
+        metadata_source = _resolve_source_path(primary=METADATA_PATH, fallback_dirs=["data"])
+        dicom_source = _resolve_source_path(primary=DICOM_PATH, fallback_dirs=["data"])
+
         bronze_metadata_df = ingest_bronze(
-            input_path=METADATA_PATH,
+            input_path=metadata_source,
             schema=METADATA_RAW_SCHEMA,
             layer_name="metadata",
             output_base=BRONZE_OUTPUT_BASE,
         )
         bronze_dicom_df = ingest_bronze(
-            input_path=DICOM_PATH,
+            input_path=dicom_source,
             schema=DICOM_RAW_SCHEMA,
             layer_name="dicom",
             output_base=BRONZE_OUTPUT_BASE,
@@ -345,12 +412,11 @@ def run_pipeline() -> dict:
         if post_join_count < min(pre_join_meta_ids, pre_join_dicom_ids):
             unmatched = min(pre_join_meta_ids, pre_join_dicom_ids) - post_join_count
             log.warning(
-                "[SILVER] %d participant IDs had no matching counterpart and were excluded. "
-                "Investigate Bronze tables for unmatched records.",
-                unmatched,
+                "[SILVER] %d participant IDs had no matching counterpart and were excluded.",
+                 unmatched,
             )
 
-        silver_output = _s3_join("output", "silver", "clinical_imaging_joined")
+        silver_output = _s3_join(SILVER_OUTPUT_BASE, "clinical_imaging_joined")
         (
             silver_joined_df.write.mode("overwrite")
             .partitionBy("site_location")
@@ -419,8 +485,8 @@ def run_pipeline() -> dict:
         log.info("[GOLD] Age distribution by site:")
         age_dist_df.show()
 
-        gold_output = _s3_join("output", "gold", "research_dataset")
-        gold_summary_output = _s3_join("output", "gold", "cohort_summary")
+        gold_output = _s3_join(GOLD_OUTPUT_BASE, "research_dataset")
+        gold_summary_output = _s3_join(GOLD_OUTPUT_BASE, "cohort_summary")
 
         gold_df.write.mode("overwrite").parquet(gold_output)
         log.info("[GOLD] Research dataset written to: %s", gold_output)
