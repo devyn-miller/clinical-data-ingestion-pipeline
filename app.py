@@ -155,23 +155,46 @@ with tab1:
                         st.warning(f"Cloud authentication failed: {exc}")
                         st.success(f"Local Simulation Enabled: Staged file under local `s3_bronze_landing/` root.")
 with tab2:
-    st.error("**RESTRICTED ACCESS:** System Engineers and Research Data Governance Board Only")
     st.subheader("Medallion Architecture Pipeline Status")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.info("**BRONZE LAYER**\n\n*Raw, Immutable S3 Landing*")
-        st.metric(label="Ingested Files awaiting ingestion", value="3", delta="+1 newly ingested")
-        st.caption(f"Target: `s3://{BRONZE_BUCKET}/{RAW_PREFIX}/`")
-    with c2:
-        st.warning("**SILVER LAYER**\n\n*Harmonization & Deduplication*")
-        st.metric(label="Patient Overlaps Merged", value="500", delta="Multi-site Unified")
-        st.caption(f"Engine: `Databricks PySpark`")
-    with c3:
-        st.success("**GOLD LAYER**\n\n*Research-Ready Aggregates*")
-        st.metric(label="Available ML Cohorts", value="500", delta="Fully De-Identified")
-        st.caption(f"Target: `s3://{BRONZE_BUCKET}/gold/`")
+    m_col1, m_col2, m_col3 = st.columns(3)
+    
+    with m_col1:
+        with st.container(border=True):
+            st.info("**BRONZE LAYER**\n\n*Raw, Immutable S3 Landing*")
+            st.metric(label="Raw files awaiting ingestion", value="3", delta="+1 newly ingested")
+            st.caption(f"**Ingest URI:** `s3://{BRONZE_BUCKET}/{RAW_PREFIX}/`")
+            st.caption(f"**Ledger Target:** `s3://{BRONZE_BUCKET}/bronze/`")
+            
+    with m_col2:
+        with st.container(border=True):
+            st.warning("**SILVER LAYER**\n\n*Harmonization & Deduplication*")
+            st.metric(label="Patient Overlaps Merged", value="500", delta="Multi-site Unified")
+            st.caption(f"**Engine:** `Databricks PySpark`")
+            st.caption(f"**Target Directory:** `s3://{BRONZE_BUCKET}/silver/`")
+            
+    with m_col3:
+        with st.container(border=True):
+            st.success("**GOLD LAYER**\n\n*Research-Ready Aggregates*")
+            st.metric(label="Available ML Cohorts", value="500", delta="Fully De-Identified")
+            st.caption(f"**Format:** Apache Parquet (ML-Ready)")
+            st.caption(f"**Target Directory:** `s3://{BRONZE_BUCKET}/gold/`")
 
+    with st.expander("S3 Bucket Directory Tree Schema Structure Map", expanded=False):
+        st.code(f"""
+s3://{BRONZE_BUCKET}/
+├── {RAW_PREFIX}/                  <-- Raw Landing Zone (Immutable writes)
+│   ├── metadata/                  <-- E.g. metadata_20260623T040830Z.csv
+│   └── dicom/                     <-- E.g. dicom_manifest.csv
+├── bronze/                       <-- Schema-enforced historical tables
+│   ├── metadata/                  <-- Partitioned: pipeline_run_date=YYYY-MM-DD/
+│   └── dicom/                     <-- Partitioned: pipeline_run_date=YYYY-MM-DD/
+├── silver/                       <-- Cleansed, Unified, and Correlated
+│   └── clinical_imaging_joined/   <-- Partitioned: site_location=CHOC | site_location=RADY/
+└── gold/                         <-- IRB-Compliant De-Identified research datasets
+    ├── research_dataset/          <-- Anonymized columns (surrogate_id, age, lesion_label...)
+    └── cohort_summary/            <-- Aggregated cohort profiling benchmarks
+        """, language="text")
     st.markdown("---")
 
     # Visual Medallion lineage inspection
@@ -180,15 +203,13 @@ with tab2:
 
     st.info("**Interactive Demo:** Below are sample datasets representing the architectural steps taken by our Databricks pipeline. Use this during code reviews to trace schema evolution, label standardization, and de-identification.")
 
-    step = st.selectbox(
-        "Select Pipeline Layer to Audit",
-        [
-            "Step 1: Raw Clinician Payload (Heterogeneous Schemas)",
-            "Step 2: Bronze Ingestion Ledger (Schema Enforced)",
-            "Step 3: Silver Transformation (Harmonized, Deduplicated & Correlated)",
-            "Step 4: Gold ML-Ready Output (Crypographically Masked PHI)"
-        ]
-    )
+    step_tab1, step_tab2, step_tab3, step_tab4 = st.tabs([
+        "1. Raw EHR Inputs",
+        "2. Bronze Schema Enforced",
+        "3. Silver Harmonized & Joined",
+        "4. Gold Anonymized & De-Identified"
+    ])
+
 
     # Pre-baked transformation datasets that mimic real system outputs
     raw_choc = pd.DataFrame({
@@ -220,10 +241,11 @@ with tab2:
         ]
     })
 
-    if "Step 1" in step:
-        st.write("#### Layer: Raw landing zone")
-        st.write("Clinicians from different sites upload different schemas. Patient `999-55-9876` visited both networks, presenting a deduplication risk.")
-        
+    # Step 1: Raw payloads
+    with step_tab1:
+        st.write("#### Stage: Raw Landing Zone")
+        st.caption("CHOC Hospital (Cerner Database schema) and Rady Hospital (Epic Database schema) upload completely inconsistent column headings, date structures, and classification mappings. Furthermore, patient `999-55-9876` visited both hospital networks, creating a cross-site duplication risk.")
+       
         col_choc, col_rady = st.columns(2)
         with col_choc:
             st.markdown("**CHOC Hospital (Cerner Database schema)**")
@@ -235,10 +257,11 @@ with tab2:
         st.markdown("**DICOM Manifest (Raw Imaging Directory)**")
         st.dataframe(raw_dicom)
 
-    elif "Step 2" in step:
-        st.write("#### Layer: Bronze Ingestion (Raw Partitions)")
-        st.write("Spark enforces strict primitive types and appends audit-trail metadata for data provenance. Each payload is partitioned chronologically.")
-        
+    # Step 2: Bronze
+    with step_tab2:
+        st.write("#### Stage: Bronze Ingestion Ledger")
+        st.caption("The Databricks pipeline enforces strict schemas on read. It appends critical analytical audit-trail columns (`ingested_at`, `source_file`, `pipeline_run_date`) and commits them to historical Delta tables. The data is kept unmodified to preserve history.")
+       
         bronze_preview = pd.DataFrame({
             "participant_id": ["C00001", "C00002", "C00003", "E00001", "E00002", "E00003"],
             "ssn": ["999-12-3456", "999-55-9876", "999-88-1111", "999-44-2222", "999-55-9876", "999-77-3333"],
@@ -252,10 +275,11 @@ with tab2:
         })
         st.dataframe(bronze_preview, use_container_width=True)
 
-    elif "Step 3" in step:
-        st.write("#### Layer: Silver Harmonization & Correlation")
-        st.write("The raw EHR schemas are unified. Overlapping patients are resolved using PySpark **Window Functions** to keep only the most recent scan (the Rady record for patient `999-55-9876` is retained; CHOC is dropped). Finally, clinical findings are matched to S3 DICOM image pointers.")
-        
+    # Step 3: Silver
+    with step_tab3:
+        st.write("#### Stage: Silver Harmonization, Deduplication & Inner Join")
+        st.caption("A Spark Window Function (`F.row_number()`) evaluates overlapping patients by `ssn` and keeps only the most recent entry (the newer Rady record is kept for patient `999-55-9876`; the CHOC record is discarded). Lesion codes are standardized to clean boolean findings, and the dataset is inner-joined with S3 DICOM image pointers.")
+       
         silver_preview = pd.DataFrame({
             "ssn": ["999-12-3456", "999-88-1111", "999-44-2222", "999-55-9876", "999-77-3333"],
             "age": [14, 11, 6, 8, 17],
@@ -273,10 +297,11 @@ with tab2:
         })
         st.dataframe(silver_preview, use_container_width=True)
 
-    elif "Step 4" in step:
-        st.write("#### Layer: Gold Research Dataset (ML-Ready)")
-        st.write("To enforce IRB and HIPAA requirements, raw demographic keys (SSN) are masked with deterministic **SHA-256 surrogate keys**. Only the anonymized features and the deep learning target variables are exposed.")
-        
+    # Step 4: Gold
+    with step_tab4:
+        st.write("#### Stage: Gold Research Cohorts (ML-Ready, PHI-Masked)")
+        st.caption("To enforce HIPAA Safe Harbor rules and satisfy IRB approvals, patient SSNs are masked with deterministic SHA-256 surrogate keys. Columns not needed by the computer vision team are purged, yielding an anonymized, high-performance dataset.")
+       
         # Calculate SHA-256 for demo
         ssns = ["999-12-3456", "999-88-1111", "999-44-2222", "999-55-9876", "999-77-3333"]
         hashes = [hashlib.sha256(s.encode()).hexdigest()[:16] for s in ssns]
