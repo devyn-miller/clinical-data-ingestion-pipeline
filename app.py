@@ -121,7 +121,7 @@ if "transmissions" not in st.session_state:
 
 # Sidebar diagnostics
 with st.sidebar:
-    st.image("https://img.icons8.com/clouds/200/hospital.png", width=120)
+    st.image("https://img.icons8.com/?size=100&id=B9ytemSyoM31&format=png&color=000000", width=120)
     st.markdown("### System Operations Panel")
     
     with st.expander("Environment Credentials Check", expanded=True):
@@ -416,7 +416,7 @@ s3://{BRONZE_BUCKET}/
         st.caption("A Spark Window Function (`F.row_number()`) evaluates overlapping patient records by `ssn` and keeps only the most recent entry. Clinical findings are standardized into standard labels, and matched with private S3 medical imaging file pointers.")
         
         if overlaps_resolved > 0:
-            st.success(f"⚡ **Deduplication Complete:** Spark Window successfully resolved `{overlaps_resolved}` multi-site patient duplicate records!")
+            st.success(f"**Deduplication Complete:** Spark Window successfully resolved `{overlaps_resolved}` multi-site patient duplicate records!")
         else:
             st.info("⚡ **Deduplication Evaluated:** No duplicate patient SSNs detected in this payload. Keeping all records.")
             
