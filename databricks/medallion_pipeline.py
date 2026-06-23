@@ -33,7 +33,7 @@ def _s3_join(*parts: str) -> str:
     if not parts:
         return ""
     first = parts[0]
-    if first.startswith("s3://"):
+    if first.startswith(("s3://", "file:", "dbfs:")):
         base = first.rstrip("/")
         rest = [p.strip("/") for p in parts[1:] if p]
         return (base + "/" + "/".join(rest)) if rest else base
@@ -107,7 +107,7 @@ def _get_spark_session() -> SparkSession:
             session = SparkSession.builder.getOrCreate()
             if session is not None:
                 try:
-                    _ = session.version   # liveness probe
+                    _ = session.version
                     return session
                 except Exception:
                     log.warning("SparkSession.builder.getOrCreate() returned a dead session.")
@@ -165,8 +165,8 @@ def _get_spark_session() -> SparkSession:
 
 
 
-AWS_ACCESS_KEY_ID = ""
-AWS_SECRET_ACCESS_KEY = ""
+AWS_ACCESS_KEY_ID = "n"
+AWS_SECRET_ACCESS_KEY = "n"
 AWS_SESSION_TOKEN = None
 
 # Directory and path parameters
@@ -175,12 +175,13 @@ RAW_PREFIX = "raw"
 LOCAL_DATA_DIR = "data"
 
 # Local paths for cluster execution
+LOCAL_DATA_DIR = os.path.abspath("data")
 METADATA_PATH: str = os.path.join(LOCAL_DATA_DIR, "metadata.csv")
 DICOM_PATH: str = os.path.join(LOCAL_DATA_DIR, "dicom_manifest.csv")
 
-BRONZE_OUTPUT_BASE: str = "output"
-SILVER_OUTPUT_BASE: str = "output/silver"
-GOLD_OUTPUT_BASE: str = "output/gold"
+BRONZE_OUTPUT_BASE: str = f"file:{os.path.abspath('output')}"
+SILVER_OUTPUT_BASE: str = f"file:{os.path.abspath('output/silver')}"
+GOLD_OUTPUT_BASE: str = f"file:{os.path.abspath('output/gold')}"
 
 
 _PLACEHOLDER_MARKERS = frozenset({
@@ -287,7 +288,11 @@ def ingest_bronze(
     Read CSV from bronze landing zone, append lineage metadata, persist as oarquet, and return df
     Params: input_path, schema, layer_name, output_base.
     """
-    log.info("[BRONZE] Reading %s from: %s", layer_name, input_path)
+    spark_read_path = input_path
+    if not spark_read_path.startswith(("s3://", "dbfs:", "file:")):
+        spark_read_path = f"file:{os.path.abspath(spark_read_path)}"
+
+    log.info("[BRONZE] Reading %s from: %s", layer_name, spark_read_path)
 
     spark = _get_spark_session()
     raw_df = (
@@ -295,7 +300,7 @@ def ingest_bronze(
         .option("mode", "PERMISSIVE")
         .option("columnNameOfCorruptRecord", "_corrupt_record")
         .schema(schema)
-        .csv(input_path)
+        .csv(spark_read_path)
     )
 
     # Corrupt-record audit
@@ -316,13 +321,13 @@ def ingest_bronze(
         log.warning(
             "[BRONZE] %s; Zero rows read. Verify the source file exists at '%s'.",
             layer_name,
-            input_path,
+            spark_read_path,
         )
 
     bronze_df = (
         raw_df
         .withColumn("ingested_at",       F.lit(pipeline_run_ts).cast("string"))
-        .withColumn("source_file",       F.lit(input_path))
+        .withColumn("source_file",       F.lit(spark_read_path))
         .withColumn("pipeline_run_date", F.lit(pipeline_run_date))
     )
 
@@ -344,13 +349,14 @@ def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
 
     base_name = os.path.basename(primary)
     for d in fallback_dirs:
-        if not os.path.isdir(d):
+        d_abs = os.path.abspath(d)
+        if not os.path.isdir(d_abs):
             continue
 
-        candidates = os.listdir(d)
+        candidates = os.listdir(d_abs)
         matched_files = []
         for f in candidates:
-            full_candidate = os.path.join(d, f)
+            full_candidate = os.path.join(d_abs, f)
             if os.path.isfile(full_candidate):
                 if "metadata" in base_name and (
                     "metadata" in f or "extract" in f or "choc" in f or "rady" in f
