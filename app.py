@@ -1,3 +1,4 @@
+import requests
 import os
 from datetime import datetime
 
@@ -24,6 +25,33 @@ AWS_REGION = _setting("AWS_REGION", "aws", "region", "us-west-2")
 RAW_PREFIX = _setting("BRONZE_RAW_PREFIX", default="raw")
 DATABRICKS_WORKSPACE = _setting("DATABRICKS_WORKSPACE_URL", "databricks", "workspace_url", "")
 DATABRICKS_JOB_NAME = _setting("DATABRICKS_JOB_NAME", "databricks", "job_name", "Medallion pipeline")
+DATABRICKS_TOKEN = _setting("DATABRICKS_PERSONAL_ACCESS_TOKEN", "databricks", "token", "")
+DATABRICKS_JOB_ID = _setting("DATABRICKS_JOB_ID", "databricks", "job_id", "")
+
+def trigger_databricks_pipeline():
+    """Triggers the Medallion Pipeline Job in Databricks via REST API."""
+    if not DATABRICKS_WORKSPACE or not DATABRICKS_TOKEN or not DATABRICKS_JOB_ID:
+        st.warning("Databricks API details or personal access token are not configured. Automation bypassed.")
+        return
+        
+    url = f"{DATABRICKS_WORKSPACE.rstrip('/')}/api/2.1/jobs/run-now"
+    headers = {
+        "Authorization": f"Bearer {DATABRICKS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "job_id": int(DATABRICKS_JOB_ID)
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if response.status_code == 200:
+            run_id = response.json().get("run_id")
+            st.success(f"Live Databricks Pipeline Run Triggered. Run ID: `{run_id}`")
+        else:
+            st.error(f"S3 uploaded but Databricks API trigger failed (Status {response.status_code}): {response.text}")
+    except Exception as e:
+        st.error(f"S3 uploaded but failed to contact Databricks API: {e}")
 
 
 def upload_to_bronze(uploaded_file, dataset_type: str) -> str:
@@ -75,6 +103,8 @@ with tab1:
                 st.error(f"Upload failed: {exc}")
             else:
                 st.success(f"Uploaded to {s3_uri}")
+                with st.spinner("Notifying Databricks cluster..."):
+                    trigger_databricks_pipeline()
 
 with tab2:
     st.subheader("Configured runtime")
