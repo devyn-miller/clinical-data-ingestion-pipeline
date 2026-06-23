@@ -2,6 +2,7 @@ import os
 import io
 import requests
 import time
+import hashlib
 from datetime import datetime
 
 import boto3
@@ -32,34 +33,7 @@ AWS_SECRET_ACCESS_KEY = _setting("AWS_SECRET_ACCESS_KEY", "aws", "aws_secret_acc
 DATABRICKS_WORKSPACE = _setting("DATABRICKS_WORKSPACE_URL", "databricks", "workspace_url", "")
 DATABRICKS_TOKEN = _setting("DATABRICKS_PERSONAL_ACCESS_TOKEN", "databricks", "token", "")
 DATABRICKS_JOB_ID = _setting("DATABRICKS_JOB_ID", "databricks", "job_id", "")
-# Place this diagnostic block right underneath your page title configurations in app.py
-st.sidebar.subheader("🔑 Live Cloud Secrets Status")
 
-if "aws" in st.secrets:
-    st.sidebar.success("✅ [aws] configuration found!")
-    
-    # Check key existence dynamically (safe Boolean status flags)
-    has_bucket = "bronze_bucket" in st.secrets["aws"]
-    has_key = "aws_access_key_id" in st.secrets["aws"]
-    has_secret = "aws_secret_access_key" in st.secrets["aws"]
-    
-    st.sidebar.write(f"• Bucket loaded: `{has_bucket}`")
-    st.sidebar.write(f"• IAM Key loaded: `{has_key}`")
-    st.sidebar.write(f"• IAM Secret loaded: `{has_secret}`")
-else:
-    st.sidebar.error("❌ [aws] section not found in Streamlit settings!")
-
-if "databricks" in st.secrets:
-    st.sidebar.success("✅ [databricks] configuration found!")
-    has_url = "workspace_url" in st.secrets["databricks"]
-    has_token = "token" in st.secrets["databricks"]
-    has_job = "job_id" in st.secrets["databricks"]
-    
-    st.sidebar.write(f"• Workspace URL loaded: `{has_url}`")
-    st.sidebar.write(f"• Orchestration Token: `{has_token}`")
-    st.sidebar.write(f"• Job ID: `{has_job}`")
-else:
-    st.sidebar.warning("⚠️ [databricks] parameters not configured. Auto-triggering bypassed.")
 
 def upload_to_bronze(file_obj: io.BytesIO, filename: str, dataset_type: str, submitter: str, affil: str) -> str:
     """Stream-pointer safe S3 Object storage uploading with unique timestamps and metadata."""
@@ -200,10 +174,135 @@ with tab2:
 
     st.markdown("---")
 
-    # Live s3 bucket listings
+    # Visual Medallion lineage inspection
+    st.subheader("Medallion Schema Lineage & Transformation Inspector")
+    st.write("This interactive console allows engineers to inspect how unharmonized hospital schemas transition into a clean, de-identified research dataset.")
+
+    st.info("**Interactive Demo:** Below are sample datasets representing the architectural steps taken by our Databricks pipeline. Use this during code reviews to trace schema evolution, label standardization, and de-identification.")
+
+    step = st.selectbox(
+        "Select Pipeline Layer to Audit",
+        [
+            "Step 1: Raw Clinician Payload (Heterogeneous Schemas)",
+            "Step 2: Bronze Ingestion Ledger (Schema Enforced)",
+            "Step 3: Silver Transformation (Harmonized, Deduplicated & Correlated)",
+            "Step 4: Gold ML-Ready Output (Crypographically Masked PHI)"
+        ]
+    )
+
+    # Pre-baked transformation datasets that mimic real system outputs
+    raw_choc = pd.DataFrame({
+        "cerner_id": ["C00001", "C00002", "C00003"],
+        "ssn": ["999-12-3456", "999-55-9876", "999-88-1111"],
+        "age": [14, 8, 11],
+        "site_location": ["CHOC", "CHOC", "CHOC"],
+        "scan_date": ["2025-02-14", "2025-05-19", "2026-01-10"],
+        "lesion_status_code": ["1", "-1", "-1"]  # (1=Lesion, -1=Clear)
+    })
+
+    raw_rady = pd.DataFrame({
+        "epic_id": ["E00001", "E00002", "E00003"],
+        "ssn": ["999-44-2222", "999-55-9876", "999-77-3333"], # 999-55-9876 visited *both* hospitals
+        "age_in_years": [6, 8, 17],
+        "site_location": ["Rady", "Rady", "Rady"],
+        "mri_date": ["2024-11-20", "2025-06-01", "2025-12-05"],
+        "lesion_status": ["Positive", "None", "NA"]  # (Positive=Lesion, None/NA=Clear)
+    })
+
+    raw_dicom = pd.DataFrame({
+        "patient_ssn": ["999-12-3456", "999-55-9876", "999-88-1111", "999-44-2222", "999-77-3333"],
+        "s3_dicom_path": [
+            "s3://choc-rady-mri-landing-zone/images/scan_10001.dcm",
+            "s3://choc-rady-mri-landing-zone/images/scan_10002.dcm",
+            "s3://choc-rady-mri-landing-zone/images/scan_10003.dcm",
+            "s3://choc-rady-mri-landing-zone/images/scan_10004.dcm",
+            "s3://choc-rady-mri-landing-zone/images/scan_10005.dcm"
+        ]
+    })
+
+    if "Step 1" in step:
+        st.write("#### Layer: Raw landing zone")
+        st.write("Clinicians from different sites upload different schemas. Patient `999-55-9876` visited both networks, presenting a deduplication risk.")
+        
+        col_choc, col_rady = st.columns(2)
+        with col_choc:
+            st.markdown("**CHOC Hospital (Cerner Database schema)**")
+            st.dataframe(raw_choc)
+        with col_rady:
+            st.markdown("**Rady Hospital (Epic Database schema)**")
+            st.dataframe(raw_rady)
+            
+        st.markdown("**DICOM Manifest (Raw Imaging Directory)**")
+        st.dataframe(raw_dicom)
+
+    elif "Step 2" in step:
+        st.write("#### Layer: Bronze Ingestion (Raw Partitions)")
+        st.write("Spark enforces strict primitive types and appends audit-trail metadata for data provenance. Each payload is partitioned chronologically.")
+        
+        bronze_preview = pd.DataFrame({
+            "participant_id": ["C00001", "C00002", "C00003", "E00001", "E00002", "E00003"],
+            "ssn": ["999-12-3456", "999-55-9876", "999-88-1111", "999-44-2222", "999-55-9876", "999-77-3333"],
+            "raw_lesion_status": ["1", "-1", "-1", "Positive", "None", "NA"],
+            "ingested_at": ["2026-06-23 13:18:04 UTC"] * 6,
+            "source_file": [
+                "file:/Workspace/data/choc_cerner_extract.csv", "file:/Workspace/data/choc_cerner_extract.csv", "file:/Workspace/data/choc_cerner_extract.csv",
+                "file:/Workspace/data/rady_epic_extract.csv", "file:/Workspace/data/rady_epic_extract.csv", "file:/Workspace/data/rady_epic_extract.csv"
+            ],
+            "pipeline_run_date": ["2026-06-23"] * 6
+        })
+        st.dataframe(bronze_preview, use_container_width=True)
+
+    elif "Step 3" in step:
+        st.write("#### Layer: Silver Harmonization & Correlation")
+        st.write("The raw EHR schemas are unified. Overlapping patients are resolved using PySpark **Window Functions** to keep only the most recent scan (the Rady record for patient `999-55-9876` is retained; CHOC is dropped). Finally, clinical findings are matched to S3 DICOM image pointers.")
+        
+        silver_preview = pd.DataFrame({
+            "ssn": ["999-12-3456", "999-88-1111", "999-44-2222", "999-55-9876", "999-77-3333"],
+            "age": [14, 11, 6, 8, 17],
+            "ehr_system": ["Cerner", "Cerner", "Epic", "Epic", "Epic"],
+            "site_location": ["CHOC", "CHOC", "RADY", "RADY", "RADY"],
+            "scan_date": ["2025-02-14", "2026-01-10", "2024-11-20", "2025-06-01", "2025-12-05"],
+            "lesion_label": ["Lesion Detected", "No Lesion Detected", "Lesion Detected", "No Lesion Detected", "No Lesion Detected"],
+            "imaging_s3_uri": [
+                "s3://choc-rady-mri-landing-zone/images/scan_10001.dcm",
+                "s3://choc-rady-mri-landing-zone/images/scan_10003.dcm",
+                "s3://choc-rady-mri-landing-zone/images/scan_10004.dcm",
+                "s3://choc-rady-mri-landing-zone/images/scan_10002.dcm",
+                "s3://choc-rady-mri-landing-zone/images/scan_10005.dcm"
+            ]
+        })
+        st.dataframe(silver_preview, use_container_width=True)
+
+    elif "Step 4" in step:
+        st.write("#### Layer: Gold Research Dataset (ML-Ready)")
+        st.write("To enforce IRB and HIPAA requirements, raw demographic keys (SSN) are masked with deterministic **SHA-256 surrogate keys**. Only the anonymized features and the deep learning target variables are exposed.")
+        
+        # Calculate SHA-256 for demo
+        ssns = ["999-12-3456", "999-88-1111", "999-44-2222", "999-55-9876", "999-77-3333"]
+        hashes = [hashlib.sha256(s.encode()).hexdigest()[:16] for s in ssns]
+        
+        gold_preview = pd.DataFrame({
+            "surrogate_id": hashes,
+            "age": [14, 11, 6, 8, 17],
+            "ehr_system": ["Cerner", "Cerner", "Epic", "Epic", "Epic"],
+            "site_location": ["CHOC", "CHOC", "RADY", "RADY", "RADY"],
+            "lesion_label": ["Lesion Detected", "No Lesion Detected", "Lesion Detected", "No Lesion Detected", "No Lesion Detected"],
+            "s3_dicom_path": [
+                "s3://choc-rady-mri-landing-zone/images/scan_10001.dcm",
+                "s3://choc-rady-mri-landing-zone/images/scan_10003.dcm",
+                "s3://choc-rady-mri-landing-zone/images/scan_10004.dcm",
+                "s3://choc-rady-mri-landing-zone/images/scan_10002.dcm",
+                "s3://choc-rady-mri-landing-zone/images/scan_10005.dcm"
+            ]
+        })
+        st.dataframe(gold_preview, use_container_width=True)
+
+    st.markdown("---")
+
+    # Live s3 bucket listing
     st.subheader("Live S3 Bronze Landing Contents")
     if st.button("Scan S3 Bronze Bucket"):
-        try:
+       try:
             client_kwargs = {"region_name": AWS_REGION}
             if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
                 client_kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
