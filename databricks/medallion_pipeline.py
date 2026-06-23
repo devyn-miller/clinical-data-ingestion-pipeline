@@ -1,7 +1,9 @@
 import logging
 import os
+import io
 import sys
 from datetime import datetime, timezone
+import pandas as pd
 
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
@@ -164,8 +166,8 @@ def _get_spark_session() -> SparkSession:
         raise exc
 
 
-AWS_ACCESS_KEY_ID = "xyz"
-AWS_SECRET_ACCESS_KEY = "abc"
+AWS_ACCESS_KEY_ID = ""
+AWS_SECRET_ACCESS_KEY = ""
 AWS_SESSION_TOKEN = None
 
 # Directory and path parameters
@@ -187,6 +189,181 @@ UC_GOLD_SUMMARY  = f"{UC_CATALOG}.{UC_SCHEMA}.gold_cohort_summary"
 BRONZE_OUTPUT_BASE = "file:///tmp/pipeline/bronze"
 SILVER_OUTPUT_BASE = "file:///tmp/pipeline/silver"
 GOLD_OUTPUT_BASE   = "file:///tmp/pipeline/gold"
+
+# S3 Medallion Output Configuration
+BRONZE_S3_PREFIX = "bronze"
+SILVER_S3_PREFIX = "silver"
+GOLD_S3_PREFIX   = "gold"
+
+# Gold ML columns: internal name -> S3 column name
+GOLD_ML_COLUMNS = {
+    "subject_surrogate_id": "surrogate_id",
+    "age":                  "age",
+    "ehr_system":           "ehr_system",
+    "site_location":        "site_location",
+    "lesion_label":         "lesion_label",
+    "imaging_s3_uri":       "s3_dicom_path",
+}
+
+
+def _get_s3_client():
+    """Return a boto3 S3 client, raising clearly if credentials are missing."""
+    if (
+        not AWS_ACCESS_KEY_ID
+        or AWS_ACCESS_KEY_ID.strip() in _PLACEHOLDER_MARKERS
+        or not AWS_SECRET_ACCESS_KEY
+        or AWS_SECRET_ACCESS_KEY.strip() in _PLACEHOLDER_MARKERS
+    ):
+        raise PipelineExecutionError(
+            "Cannot write to S3: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set."
+        )
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        aws_session_token=AWS_SESSION_TOKEN,
+    )
+
+
+def _upload_pandas_to_s3(
+    pdf: pd.DataFrame,
+    s3_client,
+    s3_key: str,
+    layer_tag: str,
+) -> str:
+    """
+    Serialize a pandas DataFrame to snappy Parquet in memory and upload
+    to S3. Returns the full s3:// URI.
+    """
+    buf = io.BytesIO()
+    pdf.to_parquet(buf, engine="pyarrow", index=False, compression="snappy")
+    buf.seek(0)
+    kb = len(buf.getvalue()) / 1024
+    log.info("[%s→S3] Uploading %.2f KB → s3://%s/%s", layer_tag, kb, AWS_BUCKET_NAME, s3_key)
+    s3_client.upload_fileobj(buf, AWS_BUCKET_NAME, s3_key)
+    uri = f"s3://{AWS_BUCKET_NAME}/{s3_key}"
+    log.info("[%s→S3] ✅  %s  (%d rows)", layer_tag, uri, len(pdf))
+    return uri
+
+
+def write_bronze_to_s3(
+    bronze_metadata_df,
+    bronze_dicom_df,
+    pipeline_run_date: str,
+) -> dict:
+    """
+    Upload Bronze metadata and DICOM manifest to S3, partitioned by
+    pipeline_run_date.
+
+    Structure:
+        bronze/metadata/pipeline_run_date=YYYY-MM-DD/part-0000.snappy.parquet
+        bronze/dicom_manifest/pipeline_run_date=YYYY-MM-DD/part-0000.snappy.parquet
+    """
+    s3 = _get_s3_client()
+    uris = {}
+
+    datasets = {
+        "metadata":       bronze_metadata_df,
+        "dicom_manifest": bronze_dicom_df,
+    }
+
+    for name, df in datasets.items():
+        log.info("[BRONZE→S3] Collecting %s to driver...", name)
+        pdf = df.toPandas()
+        s3_key = (
+            f"{BRONZE_S3_PREFIX}/{name}/"
+            f"pipeline_run_date={pipeline_run_date}/"
+            f"part-0000.snappy.parquet"
+        )
+        uris[name] = _upload_pandas_to_s3(pdf, s3, s3_key, "BRONZE")
+
+    return uris  # {"metadata": "s3://...", "dicom_manifest": "s3://..."}
+
+
+def write_silver_to_s3(silver_joined_df) -> dict:
+    """
+    Upload Silver joined DataFrame to S3, partitioned by site_location.
+
+    Structure:
+        silver/clinical_imaging_joined/site_location=CHOC/part-0000.snappy.parquet
+        silver/clinical_imaging_joined/site_location=Rady/part-0000.snappy.parquet
+        ...
+    """
+    s3 = _get_s3_client()
+    uris = {}
+
+    if "site_location" not in silver_joined_df.columns:
+        raise PipelineExecutionError(
+            "Silver DataFrame is missing 'site_location' — cannot partition for S3 upload."
+        )
+
+    sites = [
+        row["site_location"]
+        for row in silver_joined_df.select("site_location").distinct().collect()
+        if row["site_location"] is not None
+    ]
+    log.info("[SILVER→S3] Partitioning by site_location: %s", sites)
+
+    for site in sites:
+        site_pdf = (
+            silver_joined_df
+            .filter(F.col("site_location") == site)
+            .toPandas()
+        )
+        # Sanitize site name for S3 key safety
+        safe_site = site.replace(" ", "_").replace("/", "-")
+        s3_key = (
+            f"{SILVER_S3_PREFIX}/clinical_imaging_joined/"
+            f"site_location={safe_site}/"
+            f"part-0000.snappy.parquet"
+        )
+        uris[site] = _upload_pandas_to_s3(site_pdf, s3, s3_key, "SILVER")
+
+    return uris  # {"CHOC": "s3://...", "Rady": "s3://..."}
+
+
+def write_gold_to_s3(gold_df, cohort_summary_df) -> dict:
+    """
+    Upload Gold research dataset and cohort summary to S3, unpartitioned.
+    Research dataset is stripped to ML-only columns and renamed.
+
+    Structure:
+        gold/research_dataset/part-0000.snappy.parquet
+        gold/cohort_summary/part-0000.snappy.parquet
+    """
+    s3 = _get_s3_client()
+    uris = {}
+
+    # Research dataset: strip to ML columns only
+    missing = [c for c in GOLD_ML_COLUMNS if c not in gold_df.columns]
+    if missing:
+        raise PipelineExecutionError(
+            f"Gold DataFrame missing expected ML columns: {missing}"
+        )
+
+    ml_df = gold_df.select(list(GOLD_ML_COLUMNS.keys()))
+    for old, new in GOLD_ML_COLUMNS.items():
+        if old != new:
+            ml_df = ml_df.withColumnRenamed(old, new)
+
+    log.info("[GOLD→S3] Collecting research_dataset to driver...")
+    research_pdf = ml_df.toPandas()
+    uris["research_dataset"] = _upload_pandas_to_s3(
+        research_pdf, s3,
+        f"{GOLD_S3_PREFIX}/research_dataset/part-0000.snappy.parquet",
+        "GOLD",
+    )
+
+    # Cohort summary
+    log.info("[GOLD→S3] Collecting cohort_summary to driver...")
+    summary_pdf = cohort_summary_df.toPandas()
+    uris["cohort_summary"] = _upload_pandas_to_s3(
+        summary_pdf, s3,
+        f"{GOLD_S3_PREFIX}/cohort_summary/part-0000.snappy.parquet",
+        "GOLD",
+    )
+
+    return uris  # {"research_dataset": "s3://...", "cohort_summary": "s3://..."}
 
 _PLACEHOLDER_MARKERS = frozenset({
     "INSERT ACCESS KEY HERE",
@@ -564,7 +741,10 @@ def run_pipeline() -> dict:
         )
 
         metrics["bronze_metadata_rows"] = bronze_metadata_df.count()
-        metrics["bronze_dicom_rows"] = bronze_dicom_df.count()
+        metrics["bronze_dicom_rows"]    = bronze_dicom_df.count()
+
+        bronze_uris = write_bronze_to_s3(bronze_metadata_df, bronze_dicom_df, pipeline_run_date)
+        metrics["bronze_s3_uris"] = bronze_uris
         log.info("BRONZE LAYER COMPLETE")
     except Exception as exc:
         log.error("[BRONZE] Pipeline failed during Bronze ingestion: %s", exc, exc_info=True)
@@ -617,6 +797,9 @@ def run_pipeline() -> dict:
         metrics["silver_unmatched_count"] = max(
             0, min(pre_join_meta_ids, pre_join_dicom_ids) - post_join_count
         )
+
+        silver_uris = write_silver_to_s3(silver_joined_df)
+        metrics["silver_s3_uris"] = silver_uris
         log.info("SILVER LAYER COMPLETE")
     except Exception as exc:
         log.error("[SILVER] Pipeline failed during Silver transformation: %s", exc, exc_info=True)
@@ -697,6 +880,8 @@ def run_pipeline() -> dict:
         metrics["gold_flagged_for_review"] = gold_df.filter(
             F.col("lesion_code_requires_review") == True
         ).count()
+        gold_uris = write_gold_to_s3(gold_df, cohort_summary_df)
+        metrics["gold_s3_uris"] = gold_uris
         log.info("GOLD LAYER COMPLETE")
     except Exception as exc:
         log.error("[GOLD] Pipeline failed during Gold transformation: %s", exc, exc_info=True)
@@ -715,6 +900,16 @@ def run_pipeline() -> dict:
     log.info("Lesion governance      : Applied (Cerner/Epic cross-EHR code harmonization)")
     log.info("PII masking            : participant_id → SHA-256 surrogate (16-char hex prefix)")
     log.info("Date reduction         : enrollment_date → enrollment_year")
+    log.info("=" * 70)
+    log.info("S3 OUTPUT LOCATIONS")
+    log.info("=" * 70)
+    for label, uri in metrics.get("bronze_s3_uris", {}).items():
+        log.info("  Bronze %-20s : %s", label, uri)
+    for label, uri in metrics.get("silver_s3_uris", {}).items():
+        log.info("  Silver %-20s : %s", label, uri)
+    for label, uri in metrics.get("gold_s3_uris", {}).items():
+        log.info("  Gold   %-20s : %s", label, uri)
+    log.info("=" * 70)
     log.info(
         "Output locations       : %s | %s | %s",
         BRONZE_OUTPUT_BASE, SILVER_OUTPUT_BASE, GOLD_OUTPUT_BASE,
