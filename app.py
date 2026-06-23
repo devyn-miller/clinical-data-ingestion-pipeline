@@ -1,5 +1,6 @@
 import requests
 import os
+import io
 from datetime import datetime
 
 import boto3
@@ -31,8 +32,7 @@ DATABRICKS_JOB_ID = _setting("DATABRICKS_JOB_ID", "databricks", "job_id", "")
 def upload_to_bronze(file_obj: io.BytesIO, filename: str, dataset_type: str, submitter: str, affil: str) -> str:
     """Stream-pointer safe S3 Object storage uploading with unique timestamps and metadata."""
     prefix_map = {
-        "CHOC Cerner Extract": "choc",
-        "Rady Epic Extract": "rady",
+        "Clinical Metadata Extract": "metadata",
         "DICOM Imaging Manifest": "dicom",
     }
     object_prefix = prefix_map[dataset_type]
@@ -105,7 +105,7 @@ with tab1:
         affiliation = st.selectbox("Affiliation", ["CHOC", "Rady", "Research Dept", "External Partner"])
     dataset_type = st.selectbox(
         "Dataset type",
-        ["CHOC Cerner Extract", "Rady Epic Extract", "DICOM Imaging Manifest"],
+        ["Clinical Metadata Extract", "DICOM Imaging Manifest"],
     )
     uploaded_file = st.file_uploader("CSV file", type=["csv"])
 
@@ -154,11 +154,11 @@ with tab2:
         st.caption(f"Target: `s3://{BRONZE_BUCKET}/{RAW_PREFIX}/`")
     with c2:
         st.warning("**SILVER LAYER**\n\n*Harmonization & Deduplication*")
-        st.metric(label="Patient Overlaps Merged", value="50", delta="Cross-EHR SSN Match")
+        st.metric(label="Patient Overlaps Merged", value="500", delta="Multi-site Unified")
         st.caption(f"Engine: `Databricks PySpark`")
     with c3:
         st.success("**GOLD LAYER**\n\n*Research-Ready Aggregates*")
-        st.metric(label="Available ML Cohorts", value="450", delta="Fully De-Identified")
+        st.metric(label="Available ML Cohorts", value="500", delta="Fully De-Identified")
         st.caption(f"Target: `s3://{BRONZE_BUCKET}/gold/`")
 
     st.markdown("---")
