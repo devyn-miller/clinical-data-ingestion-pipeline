@@ -164,25 +164,29 @@ def _get_spark_session() -> SparkSession:
         raise exc
 
 
-
-AWS_ACCESS_KEY_ID = ""
-AWS_SECRET_ACCESS_KEY = ""
+AWS_ACCESS_KEY_ID = "xyz"
+AWS_SECRET_ACCESS_KEY = "abc"
 AWS_SESSION_TOKEN = None
 
 # Directory and path parameters
 AWS_BUCKET_NAME = "choc-rady-clinical-bronze-demo"
 RAW_PREFIX = "raw"
-LOCAL_DATA_DIR = "data"
 
-# Local paths for cluster execution
 LOCAL_DATA_DIR = os.path.abspath("data")
-METADATA_PATH: str = os.path.join(LOCAL_DATA_DIR, "metadata.csv")
-DICOM_PATH: str = os.path.join(LOCAL_DATA_DIR, "dicom_manifest.csv")
+METADATA_PATH: str = os.path.join(LOCAL_DATA_DIR, "metadata", "metadata.csv")
+DICOM_PATH: str    = os.path.join(LOCAL_DATA_DIR, "dicom_manifest.csv")
 
-BRONZE_OUTPUT_BASE: str = f"file:{os.path.abspath('output')}"
-SILVER_OUTPUT_BASE: str = f"file:{os.path.abspath('output/silver')}"
-GOLD_OUTPUT_BASE: str = f"file:{os.path.abspath('output/gold')}"
+UC_CATALOG  = "workspace"
+UC_SCHEMA   = "choc_rady"
+UC_BRONZE_META  = f"{UC_CATALOG}.{UC_SCHEMA}.bronze_metadata"
+UC_BRONZE_DICOM = f"{UC_CATALOG}.{UC_SCHEMA}.bronze_dicom"
+UC_SILVER_JOINED = f"{UC_CATALOG}.{UC_SCHEMA}.silver_clinical_imaging_joined"
+UC_GOLD_DATASET  = f"{UC_CATALOG}.{UC_SCHEMA}.gold_research_dataset"
+UC_GOLD_SUMMARY  = f"{UC_CATALOG}.{UC_SCHEMA}.gold_cohort_summary"
 
+BRONZE_OUTPUT_BASE = "file:///tmp/pipeline/bronze"
+SILVER_OUTPUT_BASE = "file:///tmp/pipeline/silver"
+GOLD_OUTPUT_BASE   = "file:///tmp/pipeline/gold"
 
 _PLACEHOLDER_MARKERS = frozenset({
     "INSERT ACCESS KEY HERE",
@@ -191,6 +195,7 @@ _PLACEHOLDER_MARKERS = frozenset({
     "PASTE_YOUR_AWS_SECRET_ACCESS_KEY_HERE",
     "",
 })
+
 
 def sync_s3_to_local_workspace() -> None:
     """
@@ -289,7 +294,7 @@ def ingest_bronze(
     Params: input_path, schema, layer_name, output_base.
     """
     spark_read_path = input_path
-    if not spark_read_path.startswith(("s3://", "dbfs:", "file:")):
+    if not spark_read_path.startswith(("s3://", "s3a://", "dbfs:", "file:")):
         spark_read_path = f"file:{os.path.abspath(spark_read_path)}"
 
     log.info("[BRONZE] Reading %s from: %s", layer_name, spark_read_path)
@@ -331,14 +336,15 @@ def ingest_bronze(
         .withColumn("pipeline_run_date", F.lit(pipeline_run_date))
     )
 
-    bronze_output = _s3_join(output_base, "bronze", layer_name)
+    table_map = {"metadata": UC_BRONZE_META, "dicom": UC_BRONZE_DICOM}
+    uc_table = table_map.get(layer_name, f"{UC_CATALOG}.{UC_SCHEMA}.bronze_{layer_name}")
     (
-        bronze_df.write.mode("overwrite")
-        .partitionBy("pipeline_run_date")
-        .parquet(bronze_output)
+        bronze_df.write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(uc_table)
     )
-    log.info("[BRONZE] %s; Written to: %s", layer_name, bronze_output)
-
+    log.info("[BRONZE] %s; Written to UC table: %s", layer_name, uc_table)
     return bronze_df
 
 
@@ -354,7 +360,6 @@ def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
             continue
 
         matched_files = []
-        # UPDATED: Use os.walk to search subdirectories (metadata/, dicom/) recursively
         for root_dir, _, files in os.walk(d_abs):
             for f in files:
                 full_candidate = os.path.join(root_dir, f)
@@ -397,7 +402,7 @@ def apply_lesion_harmonization(df: DataFrame, col_name: str = "lesion_status_cod
         F.when(is_null_or_empty, F.lit("No Lesion Detected"))
         .when(is_dirty_value, F.lit("No Lesion Detected"))
         .when(is_positive_value, F.lit("Lesion Detected"))
-        .otherwise(F.lit("No Lesion Detected"))
+        .otherwise(F.lit("Pending Radiologist Review"))
     )
 
     df = df.withColumn("lesion_label", lesion_label)
@@ -435,11 +440,13 @@ def clean_metadata(df: DataFrame) -> DataFrame:
         F.sum(F.when(F.col("lesion_label") == "Lesion Detected", 1).otherwise(0)).alias("lesion"),
         F.sum(F.when(F.col("lesion_label") == "No Lesion Detected", 1).otherwise(0)).alias("no_lesion"),
         F.sum(F.col("lesion_code_requires_review").cast("int")).alias("review"),
+        F.sum(F.when(F.col("lesion_label") == "Pending Radiologist Review",1).otherwise(0)).alias("pending"),
     ).collect()[0]
     log.info(
         "[SILVER] Metadata cleaning complete: %d rows | Lesion Detected=%d | "
-        "No Lesion Detected=%d | Flagged for review=%d",
-        stats["total"], stats["lesion"], stats["no_lesion"], stats["review"],
+        "No Lesion Detected=%d | Pending Review=%d | Flagged for review=%d",
+        stats["total"], stats["lesion"], stats["no_lesion"],
+        stats["pending"], stats["review"],
     )
     return df
 
@@ -512,20 +519,20 @@ GOLD_COLUMN_ORDER = [
 def run_pipeline() -> dict:
     """
     Execute S3 Cloud Sync and run the full Medallion pipeline end-to-end.
-
-    CHANGE: pipeline_run_ts / PIPELINE_RUN_DATE are now computed here (at call
-    time) instead of at module import time.  This ensures partition labels and
-    lineage metadata always reflect the actual pipeline invocation moment, not
-    the moment the module was first loaded.
     """
     pipeline_run_ts   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     pipeline_run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    spark = SparkSession.builder.getOrCreate()
+
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {UC_CATALOG}.{UC_SCHEMA}")
+    log.info("[UC] Target schema ready: %s.%s", UC_CATALOG, UC_SCHEMA)
 
     log.info("=" * 70)
-    log.info("PIPELINE RUN START; %s", pipeline_run_ts)
+    log.info("PIPELINE RUN START: %s", pipeline_run_ts)
     log.info("=" * 70)
-    log.info("Local storage destination: %s", LOCAL_DATA_DIR)
-    log.info("[SILVER] Governance rule: %s", LESION_GOVERNANCE_RULE)
+    log.info("Local staging destination : %s", LOCAL_DATA_DIR)
+    log.info("Bronze output base        : %s", BRONZE_OUTPUT_BASE)
+    log.info("[SILVER] Governance rule  : %s", LESION_GOVERNANCE_RULE)
 
     # Trigger Serverless-safe AWS S3 Sync
     sync_s3_to_local_workspace()
@@ -598,13 +605,13 @@ def run_pipeline() -> dict:
                 unmatched,
             )
 
-        silver_output = _s3_join(SILVER_OUTPUT_BASE, "clinical_imaging_joined")
         (
-            silver_joined_df.write.mode("overwrite")
-            .partitionBy("site_location")
-            .parquet(silver_output)
+            silver_joined_df.write.format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(UC_SILVER_JOINED)
         )
-        log.info("[SILVER] Written to: %s", silver_output)
+        log.info("[SILVER] Written to UC table: %s", UC_SILVER_JOINED)
 
         metrics["silver_joined_rows"] = post_join_count
         metrics["silver_unmatched_count"] = max(
@@ -670,11 +677,21 @@ def run_pipeline() -> dict:
         gold_output = _s3_join(GOLD_OUTPUT_BASE, "research_dataset")
         gold_summary_output = _s3_join(GOLD_OUTPUT_BASE, "cohort_summary")
 
-        gold_df.write.mode("overwrite").parquet(gold_output)
-        log.info("[GOLD] Research dataset written to: %s", gold_output)
+        (
+            gold_df.write.format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(UC_GOLD_DATASET)
+        )
+        log.info("[GOLD] Research dataset written to UC table: %s", UC_GOLD_DATASET)
 
-        cohort_summary_df.write.mode("overwrite").parquet(gold_summary_output)
-        log.info("[GOLD] Cohort summary written to: %s", gold_summary_output)
+        (
+            cohort_summary_df.write.format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(UC_GOLD_SUMMARY)
+        )
+        log.info("[GOLD] Cohort summary written to UC table: %s", UC_GOLD_SUMMARY)
 
         metrics["gold_rows"] = gold_row_count
         metrics["gold_flagged_for_review"] = gold_df.filter(
