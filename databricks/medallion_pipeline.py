@@ -22,12 +22,21 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# Custom exception for pipeline failures
 class PipelineExecutionError(Exception):
     """Raised when a Medallion layer (Bronze/Silver/Gold) fails to complete."""
 
 def _s3_join(*parts: str) -> str:
-    """Join S3 path components without os.path.join's platform-specific separator."""
+    """
+    Join S3 (or local) path components without os.path.join's platform-specific
+    separator.
+    """
+    if not parts:
+        return ""
+    first = parts[0]
+    if first.startswith("s3://"):
+        base = first.rstrip("/")
+        rest = [p.strip("/") for p in parts[1:] if p]
+        return (base + "/" + "/".join(rest)) if rest else base
     return "/".join(p.strip("/") for p in parts if p)
 
 
@@ -50,44 +59,85 @@ class MockSparkSession:
 
 
 def _get_spark_session() -> SparkSession:
-    """Retrieve the active SparkSession, adapt to Databricks Serverless, or bootstrap a local session."""
-    # 1. Retrieve any existing active Spark session
-    session = SparkSession.getActiveSession()
-    if session is not None:
-        return session
-
-    # 2. Try importing from databricks.sdk.runtime (Official cluster/serverless Python script runtime)
+    """
+    Retrieve the active SparkSession, adapt to Databricks Serverless, or
+    bootstrap a local session.
+    """
+    # 1: Reuse any already-active session
     try:
-        from databricks.sdk.runtime import spark
-        if spark is not None:
-            log.info("Databricks SDK runtime detected. Successfully resolved native 'spark' session.")
-            return spark
+        session = SparkSession.getActiveSession()
+        if session is not None:
+            try:
+                _ = session.version
+                return session
+            except Exception:
+                log.warning("Active SparkSession exists but JVM is unresponsive. Continuing fallback chain.")
+    except Exception:
+        pass
+
+    # 2: Databricks SDK runtime (notebooks/jobs)
+    try:
+        from databricks.sdk.runtime import spark as _sdk_spark
+        if _sdk_spark is not None:
+            try:
+                _ = _sdk_spark.version
+                log.info(
+                    "Databricks SDK runtime detected. "
+                    "Successfully resolved native 'spark' session."
+                )
+                return _sdk_spark
+            except Exception as probe_exc:
+                log.warning(
+                    "Databricks SDK spark object is non-functional (%s). "
+                    "Continuing session fallback chain.", probe_exc
+                )
     except (ImportError, ModuleNotFoundError, AttributeError):
         pass
 
-    # 3. Check if we are running inside a real Databricks cluster as fallback
-    is_databricks = "DATABRICKS_RUNTIME_VERSION" in os.environ or "DATABRICKS_WORKSPACE_PORT" in os.environ
-
+    # 3: Standard Databricks cluster/Serverless
+    is_databricks = (
+        "DATABRICKS_RUNTIME_VERSION" in os.environ
+        or "DATABRICKS_WORKSPACE_PORT" in os.environ
+    )
     if is_databricks:
-        log.info("Databricks Cluster runtime detected. Fetching workspace-configured SparkSession.")
+        log.info("Databricks cluster runtime detected. Fetching workspace-configured SparkSession.")
+
+        # 3a: Standard builder
         try:
-            # Standard getOrCreate() without specifying .master() or DatabricksSession
-            # automatically resolves to the serverless cluster execution engine.
             session = SparkSession.builder.getOrCreate()
             if session is not None:
-                return session
-        except Exception as exc:
-            log.warning("Standard SparkSession builder failed on Databricks (%s). Attempting DatabricksSession...", str(exc))
-            try:
-                from databricks.connect import DatabricksSession
-                session = DatabricksSession.builder.getOrCreate()
-                if session is not None:
+                try:
+                    _ = session.version   # liveness probe
                     return session
-            except Exception as inner_exc:
-                log.warning("All cloud Spark session attempts failed: %s", str(inner_exc))
+                except Exception:
+                    log.warning("SparkSession.builder.getOrCreate() returned a dead session.")
+        except Exception as exc:
+            log.warning(
+                "Standard SparkSession builder failed on Databricks (%s). "
+                "Attempting DatabricksSession...", str(exc)
+            )
 
+        # 3b: Databricks Connect (remote execution)
+        try:
+            from databricks.connect import DatabricksSession
+            session = DatabricksSession.builder.getOrCreate()
+            if session is not None:
+                try:
+                    _ = session.version
+                    return session
+                except Exception:
+                    log.warning("DatabricksSession returned a dead session.")
+        except Exception as inner_exc:
+            log.warning("All cloud Spark session attempts failed: %s", str(inner_exc))
 
-    # 4. Local/Offline fallback for Pytest, GitHub Actions, and local terminal runs
+        # Fall back to MockSparkSession
+        log.warning(
+            "No live Databricks session available. "
+            "Initializing MockSparkSession for offline pipeline verification."
+        )
+        return MockSparkSession()
+
+    # 4: Local/offline (pytest, GitHub Actions, local terminal)
     log.info("Running locally/offline; bootstrapping local testing SparkSession.")
     try:
         session = (
@@ -101,10 +151,13 @@ def _get_spark_session() -> SparkSession:
         session.sparkContext.setLogLevel("WARN")
         return session
     except Exception as exc:
-        # If running inside a restricted Databricks terminal where local context is blocked, trigger MockSparkSession
-        if "Only remote Spark sessions using Databricks Connect are supported" in str(exc) or is_databricks:
+        if (
+            "Only remote Spark sessions using Databricks Connect are supported" in str(exc)
+            or is_databricks
+        ):
             log.warning(
-                "⚠️ Restricted Databricks terminal sandbox detected (Local JVM creation blocked on CLI). "
+                "Restricted Databricks terminal sandbox detected "
+                "(local JVM creation blocked). "
                 "Initializing MockSparkSession for offline pipeline testing..."
             )
             return MockSparkSession()
@@ -116,7 +169,7 @@ AWS_ACCESS_KEY_ID = ""
 AWS_SECRET_ACCESS_KEY = ""
 AWS_SESSION_TOKEN = None
 
-# Directory & path parameters
+# Directory and path parameters
 AWS_BUCKET_NAME = "choc-rady-clinical-bronze-demo"
 RAW_PREFIX = "raw"
 LOCAL_DATA_DIR = "data"
@@ -128,32 +181,46 @@ DICOM_PATH: str = os.path.join(LOCAL_DATA_DIR, "dicom_manifest.csv")
 BRONZE_OUTPUT_BASE: str = "output"
 SILVER_OUTPUT_BASE: str = "output/silver"
 GOLD_OUTPUT_BASE: str = "output/gold"
-PIPELINE_RUN_TS: str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-PIPELINE_RUN_DATE: str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-log.info("Pipeline run timestamp: %s", PIPELINE_RUN_TS)
-log.info("Local storage destination: %s", LOCAL_DATA_DIR)
 
-def sync_s3_to_local_workspace():
+_PLACEHOLDER_MARKERS = frozenset({
+    "INSERT ACCESS KEY HERE",
+    "INSERT SECRET HERE",
+    "PASTE_YOUR_AWS_ACCESS_KEY_ID_HERE",
+    "PASTE_YOUR_AWS_SECRET_ACCESS_KEY_HERE",
+    "",
+})
+
+def sync_s3_to_local_workspace() -> None:
     """
-    Connects to the AWS Bronze bucket via Boto3, downloads the newest raw clinical
-    uploads, and stages them locally in the cluster workspace.
+    Connects to the AWS Bronze bucket via Boto3, downloads the newest raw
+    clinical uploads, and stages them locally in the cluster workspace.
     """
-    if AWS_ACCESS_KEY_ID == "PASTE_YOUR_AWS_ACCESS_KEY_ID_HERE" or not AWS_ACCESS_KEY_ID:
-        log.info("[S3 SYNC] No AWS credentials entered in CELL 0. Skipping cloud sync and using local data cache.")
+    if (
+        not AWS_ACCESS_KEY_ID
+        or AWS_ACCESS_KEY_ID.strip() in _PLACEHOLDER_MARKERS
+        or not AWS_SECRET_ACCESS_KEY
+        or AWS_SECRET_ACCESS_KEY.strip() in _PLACEHOLDER_MARKERS
+    ):
+        log.info(
+            "[S3 SYNC] No AWS credentials configured. "
+            "Skipping cloud sync and using local data cache."
+        )
         return
 
     os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
-    
+
     s3_client = boto3.client(
         "s3",
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        aws_session_token=AWS_SESSION_TOKEN
+        aws_session_token=AWS_SESSION_TOKEN,
     )
 
-    log.info("[S3 SYNC] Scanning S3 Bucket '%s' under prefix '%s/'...", AWS_BUCKET_NAME, RAW_PREFIX)
-
+    log.info(
+        "[S3 SYNC] Scanning S3 Bucket '%s' under prefix '%s/'...",
+        AWS_BUCKET_NAME, RAW_PREFIX,
+    )
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=AWS_BUCKET_NAME, Prefix=RAW_PREFIX)
@@ -164,55 +231,61 @@ def sync_s3_to_local_workspace():
                 s3_key = obj["Key"]
                 if s3_key.endswith("/"):
                     continue
-                
-                filename = os.path.basename(s3_key)
-                local_dest_path = os.path.join(LOCAL_DATA_DIR, filename)
-                
-                log.info("[S3 SYNC] Syncing s3://%s/%s ──> %s", AWS_BUCKET_NAME, s3_key, local_dest_path)
+
+                relative_key = s3_key[len(RAW_PREFIX):].lstrip("/")
+                local_dest_path = os.path.join(LOCAL_DATA_DIR, relative_key)
+                os.makedirs(os.path.dirname(local_dest_path), exist_ok=True)
+
+                log.info(
+                    "[S3 SYNC] Syncing s3://%s/%s ──> %s",
+                    AWS_BUCKET_NAME, s3_key, local_dest_path,
+                )
                 s3_client.download_file(AWS_BUCKET_NAME, s3_key, local_dest_path)
                 downloaded += 1
                 
         if downloaded > 0:
-            log.info("[S3 SYNC] Sync complete. Staged %d clinical files to active workspace.", downloaded)
+            log.info(
+                "[S3 SYNC] Sync complete. Staged %d clinical files to active workspace.",
+                downloaded,
+            )
         else:
-            log.warning("[S3 SYNC] S3 Scan finished but no clinical files were found in the bucket.")
-            
+            log.warning(
+                "[S3 SYNC] S3 scan finished but no clinical files were found in the bucket."
+            )
+
     except (NoCredentialsError, ClientError) as exc:
-        log.error("[S3 SYNC] S3 Access failed: %s", exc)
+        log.error("[S3 SYNC] S3 access failed: %s", exc)
         raise PipelineExecutionError(f"Failed to pull files from AWS S3: {exc}")
 
 
-METADATA_RAW_SCHEMA = StructType(
-    [
-        StructField("participant_id", StringType(), nullable=False),
-        StructField("age", StringType(), nullable=True),
-        StructField("site_location", StringType(), nullable=True),
-        StructField("ehr_system", StringType(), nullable=True),
-        StructField("lesion_status_code", StringType(), nullable=True),
-        StructField("enrollment_date", StringType(), nullable=True),
-    ]
-)
+# Schemas
+METADATA_RAW_SCHEMA = StructType([
+    StructField("participant_id",    StringType(), nullable=False),
+    StructField("age",               StringType(), nullable=True),
+    StructField("site_location",     StringType(), nullable=True),
+    StructField("ehr_system",        StringType(), nullable=True),
+    StructField("lesion_status_code",StringType(), nullable=True),
+    StructField("enrollment_date",   StringType(), nullable=True),
+])
 
-DICOM_RAW_SCHEMA = StructType(
-    [
-        StructField("participant_id", StringType(), nullable=False),
-        StructField("dicom_s3_uri", StringType(), nullable=True),
-        StructField("modality", StringType(), nullable=True),
-        StructField("body_region", StringType(), nullable=True),
-    ]
-)
-
-
+DICOM_RAW_SCHEMA = StructType([
+    StructField("participant_id", StringType(), nullable=False),
+    StructField("dicom_s3_uri",   StringType(), nullable=True),
+    StructField("modality",       StringType(), nullable=True),
+    StructField("body_region",    StringType(), nullable=True),
+])
 
 def ingest_bronze(
     input_path: str,
     schema: StructType,
     layer_name: str,
     output_base: str,
+    pipeline_run_ts: str,
+    pipeline_run_date: str,
 ) -> DataFrame:
     """
-    Read a CSV from the Bronze landing zone, append lineage metadata, persist as Parquet, and return the DataFrame.
-    Parameters: input_path, schema, layer_name, output_base.
+    Read CSV from bronze landing zone, append lineage metadata, persist as oarquet, and return df
+    Params: input_path, schema, layer_name, output_base.
     """
     log.info("[BRONZE] Reading %s from: %s", layer_name, input_path)
 
@@ -225,22 +298,32 @@ def ingest_bronze(
         .csv(input_path)
     )
 
+    # Corrupt-record audit
+    if "_corrupt_record" in raw_df.columns:
+        corrupt_count = raw_df.filter(F.col("_corrupt_record").isNotNull()).count()
+        if corrupt_count > 0:
+            log.warning(
+                "[BRONZE] %s; %d corrupt / unparseable rows detected. "
+                "These rows will have null field values in downstream layers.",
+                layer_name, corrupt_count,
+            )
+        raw_df = raw_df.drop("_corrupt_record")
+
     row_count = raw_df.count()
-    log.info("[BRONZE] %s — %d rows ingested from source.", layer_name, row_count)
+    log.info("[BRONZE] %s; %d rows ingested from source.", layer_name, row_count)
 
     if row_count == 0:
         log.warning(
-            "[BRONZE] %s — Zero rows read. Verify the source file exists at '%s'.",
+            "[BRONZE] %s; Zero rows read. Verify the source file exists at '%s'.",
             layer_name,
             input_path,
         )
 
-    bronze_df = raw_df.withColumn(
-        "ingested_at", F.lit(PIPELINE_RUN_TS).cast("string")
-    ).withColumn(
-        "source_file", F.lit(input_path)
-    ).withColumn(
-        "pipeline_run_date", F.lit(PIPELINE_RUN_DATE)
+    bronze_df = (
+        raw_df
+        .withColumn("ingested_at",       F.lit(pipeline_run_ts).cast("string"))
+        .withColumn("source_file",       F.lit(input_path))
+        .withColumn("pipeline_run_date", F.lit(pipeline_run_date))
     )
 
     bronze_output = _s3_join(output_base, "bronze", layer_name)
@@ -249,7 +332,7 @@ def ingest_bronze(
         .partitionBy("pipeline_run_date")
         .parquet(bronze_output)
     )
-    log.info("[BRONZE] %s — Written to: %s", layer_name, bronze_output)
+    log.info("[BRONZE] %s; Written to: %s", layer_name, bronze_output)
 
     return bronze_df
 
@@ -269,8 +352,9 @@ def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
         for f in candidates:
             full_candidate = os.path.join(d, f)
             if os.path.isfile(full_candidate):
-                # Dynamically match files containing keywords
-                if "metadata" in base_name and ("metadata" in f or "extract" in f or "choc" in f or "rady" in f):
+                if "metadata" in base_name and (
+                    "metadata" in f or "extract" in f or "choc" in f or "rady" in f
+                ):
                     matched_files.append(full_candidate)
                 elif "dicom_manifest" in base_name and "dicom_manifest" in f:
                     matched_files.append(full_candidate)
@@ -278,7 +362,10 @@ def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
         if matched_files:
             # Sort descending by modification time to retrieve newest sync run
             matched_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            log.info("Source dynamically resolved to newest sync candidate: %s → %s", primary, matched_files[0])
+            log.info(
+                "Source dynamically resolved to newest sync candidate: %s → %s",
+                primary, matched_files[0],
+            )
             return matched_files[0]
 
     return primary
@@ -293,8 +380,6 @@ LESION_GOVERNANCE_RULE = (
     "and are harmonized to 'No Lesion Detected'. Codes outside this known set "
     "are flagged via lesion_code_requires_review."
 )
-
-log.info("[SILVER] Governance rule registered: %s", LESION_GOVERNANCE_RULE)
 
 
 def apply_lesion_harmonization(df: DataFrame, col_name: str = "lesion_status_code") -> DataFrame:
@@ -320,24 +405,19 @@ def apply_lesion_harmonization(df: DataFrame, col_name: str = "lesion_status_cod
 
 def clean_metadata(df: DataFrame) -> DataFrame:
     """Clean, standardize, and type-cast metadata records."""
-    log.info("[SILVER] Cleaning metadata — %d raw rows", df.count())
+    log.info("[SILVER] Cleaning metadata; %d raw rows", df.count())
 
     df = df.filter(F.col("participant_id").isNotNull())
 
-    string_cols = [
-        "participant_id", "site_location", "ehr_system",
-        "lesion_status_code", "enrollment_date",
-    ]
-    for col in string_cols:
+    for col in ["participant_id", "site_location", "ehr_system",
+                "lesion_status_code", "enrollment_date"]:
         df = df.withColumn(col, F.trim(F.col(col)))
 
     df = (
-        df.withColumn("age", F.col("age").cast(IntegerType()))
-        .withColumn(
-            "enrollment_date",
-            F.to_date(F.col("enrollment_date"), "yyyy-MM-dd"),
-        )
-        .withColumn("site_location", F.upper(F.col("site_location")))
+        df
+        .withColumn("age",             F.col("age").cast(IntegerType()))
+        .withColumn("enrollment_date", F.to_date(F.col("enrollment_date"), "yyyy-MM-dd"))
+        .withColumn("site_location",   F.upper(F.col("site_location")))
     )
 
     df = apply_lesion_harmonization(df, "lesion_status_code")
@@ -347,30 +427,30 @@ def clean_metadata(df: DataFrame) -> DataFrame:
         (F.col("age").isNull() | F.col("enrollment_date").isNull()).cast("boolean"),
     )
 
-    row_count = df.count()
-    lesion_count = df.filter(F.col("lesion_label") == "Lesion Detected").count()
-    no_lesion_count = df.filter(F.col("lesion_label") == "No Lesion Detected").count()
-    review_count = df.filter(F.col("lesion_code_requires_review") == True).count()
-
+    # Single aggregation pass instead of 4 separate .count() actions
+    stats = df.agg(
+        F.count("*").alias("total"),
+        F.sum(F.when(F.col("lesion_label") == "Lesion Detected", 1).otherwise(0)).alias("lesion"),
+        F.sum(F.when(F.col("lesion_label") == "No Lesion Detected", 1).otherwise(0)).alias("no_lesion"),
+        F.sum(F.col("lesion_code_requires_review").cast("int")).alias("review"),
+    ).collect()[0]
     log.info(
         "[SILVER] Metadata cleaning complete: %d rows | Lesion Detected=%d | "
         "No Lesion Detected=%d | Flagged for review=%d",
-        row_count, lesion_count, no_lesion_count, review_count,
+        stats["total"], stats["lesion"], stats["no_lesion"], stats["review"],
     )
     return df
 
 
 def clean_dicom(df: DataFrame) -> DataFrame:
     """Clean and standardize DICOM manifest records."""
-    log.info("[SILVER] Cleaning DICOM manifest — %d raw rows", df.count())
+    log.info("[SILVER] Cleaning DICOM manifest; %d raw rows", df.count())
 
     df = df.filter(
         F.col("participant_id").isNotNull() & F.col("dicom_s3_uri").isNotNull()
     )
-
-    df = df.withColumn("modality", F.upper(F.trim(F.col("modality"))))
+    df = df.withColumn("modality",    F.upper(F.initcap(F.trim(F.col("modality")))))
     df = df.withColumn("body_region", F.initcap(F.trim(F.col("body_region"))))
-
     df = df.withColumn(
         "uri_format_valid",
         F.col("dicom_s3_uri").startswith("s3://").cast("boolean"),
@@ -428,18 +508,30 @@ GOLD_COLUMN_ORDER = [
 
 
 def run_pipeline() -> dict:
-    """Execute S3 Cloud Sync, and run the full Medallion pipeline end-to-end."""
+    """
+    Execute S3 Cloud Sync and run the full Medallion pipeline end-to-end.
+
+    CHANGE: pipeline_run_ts / PIPELINE_RUN_DATE are now computed here (at call
+    time) instead of at module import time.  This ensures partition labels and
+    lineage metadata always reflect the actual pipeline invocation moment, not
+    the moment the module was first loaded.
+    """
+    pipeline_run_ts   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    pipeline_run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     log.info("=" * 70)
-    log.info("PIPELINE RUN START — %s", PIPELINE_RUN_TS)
+    log.info("PIPELINE RUN START; %s", pipeline_run_ts)
     log.info("=" * 70)
+    log.info("Local storage destination: %s", LOCAL_DATA_DIR)
+    log.info("[SILVER] Governance rule: %s", LESION_GOVERNANCE_RULE)
 
     # Trigger Serverless-safe AWS S3 Sync
     sync_s3_to_local_workspace()
 
-    metrics: dict = {"run_timestamp": PIPELINE_RUN_TS}
+    metrics: dict = {"run_timestamp": pipeline_run_ts}
 
     log.info("=" * 70)
-    log.info("BRONZE LAYER — BEGIN")
+    log.info("BRONZE LAYER BEGINNING")
     log.info("=" * 70)
     try:
         metadata_source = _resolve_source_path(primary=METADATA_PATH, fallback_dirs=["data"])
@@ -450,23 +542,27 @@ def run_pipeline() -> dict:
             schema=METADATA_RAW_SCHEMA,
             layer_name="metadata",
             output_base=BRONZE_OUTPUT_BASE,
+            pipeline_run_ts=pipeline_run_ts,
+            pipeline_run_date=pipeline_run_date,
         )
         bronze_dicom_df = ingest_bronze(
             input_path=dicom_source,
             schema=DICOM_RAW_SCHEMA,
             layer_name="dicom",
             output_base=BRONZE_OUTPUT_BASE,
+            pipeline_run_ts=pipeline_run_ts,
+            pipeline_run_date=pipeline_run_date,
         )
 
         metrics["bronze_metadata_rows"] = bronze_metadata_df.count()
         metrics["bronze_dicom_rows"] = bronze_dicom_df.count()
-        log.info("BRONZE LAYER — COMPLETE")
+        log.info("BRONZE LAYER COMPLETE")
     except Exception as exc:
         log.error("[BRONZE] Pipeline failed during Bronze ingestion: %s", exc, exc_info=True)
         raise PipelineExecutionError(f"Bronze layer failed: {exc}") from exc
 
     log.info("=" * 70)
-    log.info("SILVER LAYER — BEGIN")
+    log.info("SILVER LAYER BEGINNING")
     log.info("=" * 70)
     try:
         silver_metadata_df = clean_metadata(bronze_metadata_df)
@@ -512,13 +608,13 @@ def run_pipeline() -> dict:
         metrics["silver_unmatched_count"] = max(
             0, min(pre_join_meta_ids, pre_join_dicom_ids) - post_join_count
         )
-        log.info("SILVER LAYER — COMPLETE")
+        log.info("SILVER LAYER COMPLETE")
     except Exception as exc:
         log.error("[SILVER] Pipeline failed during Silver transformation: %s", exc, exc_info=True)
         raise PipelineExecutionError(f"Silver layer failed: {exc}") from exc
 
     log.info("=" * 70)
-    log.info("GOLD LAYER — BEGIN")
+    log.info("GOLD LAYER BEGINNING")
     log.info("=" * 70)
     try:
         gold_df = mask_participant_id(silver_joined_df)
@@ -546,10 +642,10 @@ def run_pipeline() -> dict:
         log.info("[GOLD] Cohort summary by site and lesion finding:")
         cohort_summary_df.show(truncate=False)
 
-        lesion_dist_df = gold_df.groupBy("lesion_label").agg(F.count("*").alias("n"))
-        total_n = gold_row_count
-        lesion_dist_df = lesion_dist_df.withColumn(
-            "pct", F.round(F.col("n") / F.lit(total_n) * 100, 2)
+        lesion_dist_df = (
+            gold_df.groupBy("lesion_label")
+            .agg(F.count("*").alias("n"))
+            .withColumn("pct", F.round(F.col("n") / F.lit(gold_row_count) * 100, 2))
         )
         log.info("[GOLD] Lesion finding distribution:")
         lesion_dist_df.show()
@@ -582,7 +678,7 @@ def run_pipeline() -> dict:
         metrics["gold_flagged_for_review"] = gold_df.filter(
             F.col("lesion_code_requires_review") == True
         ).count()
-        log.info("GOLD LAYER — COMPLETE")
+        log.info("GOLD LAYER COMPLETE")
     except Exception as exc:
         log.error("[GOLD] Pipeline failed during Gold transformation: %s", exc, exc_info=True)
         raise PipelineExecutionError(f"Gold layer failed: {exc}") from exc
@@ -602,9 +698,7 @@ def run_pipeline() -> dict:
     log.info("Date reduction         : enrollment_date → enrollment_year")
     log.info(
         "Output locations       : %s | %s | %s",
-        BRONZE_OUTPUT_BASE,
-        SILVER_OUTPUT_BASE,
-        GOLD_OUTPUT_BASE,
+        BRONZE_OUTPUT_BASE, SILVER_OUTPUT_BASE, GOLD_OUTPUT_BASE,
     )
     log.info("=" * 70)
     log.info("Pipeline run complete.")
