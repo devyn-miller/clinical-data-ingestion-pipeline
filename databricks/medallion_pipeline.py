@@ -165,8 +165,8 @@ def _get_spark_session() -> SparkSession:
 
 
 
-AWS_ACCESS_KEY_ID = "n"
-AWS_SECRET_ACCESS_KEY = "n"
+AWS_ACCESS_KEY_ID = ""
+AWS_SECRET_ACCESS_KEY = ""
 AWS_SESSION_TOKEN = None
 
 # Directory and path parameters
@@ -343,7 +343,7 @@ def ingest_bronze(
 
 
 def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
-    """Return the first path that exists, fallback to alternatives locally."""
+    """Return the first path that exists, fallback to recursively searched alternatives."""
     if os.path.exists(primary):
         return primary
 
@@ -353,25 +353,21 @@ def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
         if not os.path.isdir(d_abs):
             continue
 
-        candidates = os.listdir(d_abs)
         matched_files = []
-        for f in candidates:
-            full_candidate = os.path.join(d_abs, f)
-            if os.path.isfile(full_candidate):
-                if "metadata" in base_name and (
-                    "metadata" in f or "extract" in f or "choc" in f or "rady" in f
-                ):
+        # UPDATED: Use os.walk to search subdirectories (metadata/, dicom/) recursively
+        for root_dir, _, files in os.walk(d_abs):
+            for f in files:
+                full_candidate = os.path.join(root_dir, f)
+                
+                # Logic to match metadata or dicom files based on base_name
+                if "metadata" in base_name and any(x in f.lower() for x in ["metadata", "extract", "choc", "rady"]):
                     matched_files.append(full_candidate)
-                elif "dicom_manifest" in base_name and "dicom_manifest" in f:
+                elif "dicom" in base_name.lower() and "dicom" in f.lower():
                     matched_files.append(full_candidate)
 
         if matched_files:
-            # Sort descending by modification time to retrieve newest sync run
             matched_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            log.info(
-                "Source dynamically resolved to newest sync candidate: %s → %s",
-                primary, matched_files[0],
-            )
+            log.info("Source dynamically resolved to newest candidate: %s → %s", primary, matched_files[0])
             return matched_files[0]
 
     return primary
