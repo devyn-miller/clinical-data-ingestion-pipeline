@@ -31,18 +31,30 @@ def _s3_join(*parts: str) -> str:
     return "/".join(p.strip("/") for p in parts if p)
 
 def _get_spark_session() -> SparkSession:
-    """Retrieve the active SparkSession or bootstrap an isolated local session."""
+    """Retrieve the active SparkSession, build a Serverless Databricks session, or bootstrap a local session."""
     session = SparkSession.getActiveSession()
-    if session is None:
-        log.info("No active SparkSession found — bootstrapping a new local session.")
-        session = (
-            SparkSession.builder.appName("choc_rady_medallion_pipeline")
-            .config("spark.sql.shuffle.partitions", "4")
-            .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
-            .config("spark.driver.memory", "2g")
-            .getOrCreate()
-        )
-        session.sparkContext.setLogLevel("WARN")
+    if session is not None:
+        return session
+
+    # Try loading Serverless-friendly Databricks Connect session first
+    try:
+        from databricks.connect import DatabricksSession
+        log.info("Databricks Serverless runtime detected — building session via DatabricksSession.")
+        session = DatabricksSession.builder.getOrCreate()
+        return session
+    except (ImportError, ModuleNotFoundError, Exception) as exc:
+        log.info("DatabricksSession unavailable (%s) — falling back to standard local SparkSession.", str(exc))
+
+    # Standard offline fallback for Pytest & Local development
+    log.info("No active SparkSession found — bootstrapping standard local session.")
+    session = (
+        SparkSession.builder.appName("choc_rady_medallion_pipeline")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        .config("spark.driver.memory", "2g")
+        .getOrCreate()
+    )
+    session.sparkContext.setLogLevel("WARN")
     return session
 
 AWS_ACCESS_KEY_ID = "PASTE_YOUR_AWS_ACCESS_KEY_ID_HERE"
@@ -191,12 +203,30 @@ def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
     """Return the first path that exists, fallback to alternatives locally."""
     if os.path.exists(primary):
         return primary
+
+    base_name = os.path.basename(primary)
     for d in fallback_dirs:
-        candidate = os.path.join(d, os.path.basename(primary))
-        if os.path.exists(candidate):
-            log.info("Source resolved via fallback: %s → %s", primary, candidate)
-            return candidate
-    return primary
+        if not os.path.isdir(d):
+            continue
+
+        candidates = os.listdir(d)
+        matched_files = []
+        for f in candidates:
+            full_candidate = os.path.join(d, f)
+            if os.path.isfile(full_candidate):
+                # Dynamically match files containing keywords (accounting for unique Streamlit timestamps)
+                if "metadata" in base_name and ("metadata" in f or "extract" in f or "choc" in f or "rady" in f):
+                    matched_files.append(full_candidate)
+                elif "dicom_manifest" in base_name and "dicom_manifest" in f:
+                    matched_files.append(full_candidate)
+
+        if matched_files:
+            # Sort descending by modification time to retrieve the newest sync run
+            matched_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            log.info("Source dynamically resolved to newest sync candidate: %s → %s", primary, matched_files[0])
+            return matched_files[0]
+
+   return primary
 
 DIRTY_LESION_VALUES = {"-1", "NA", "na", "N/A", "n/a", "none", "None", ""}
 POSITIVE_LESION_VALUES = {"1", "positive", "Positive", "POSITIVE"}
