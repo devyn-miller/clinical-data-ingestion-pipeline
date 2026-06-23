@@ -236,7 +236,11 @@ def _upload_pandas_to_s3(
     to S3. Returns the full s3:// URI.
     """
     buf = io.BytesIO()
-    pdf.to_parquet(buf, engine="pyarrow", index=False, compression="snappy")
+    pdf_ready = pdf.copy()
+    pdf_ready.attrs = {} 
+    
+    pdf_ready.to_parquet(buf, engine="pyarrow", index=False, compression="snappy")
+    # pdf.to_parquet(buf, engine="pyarrow", index=False, compression="snappy")
     buf.seek(0)
     kb = len(buf.getvalue()) / 1024
     log.info("[%s→S3] Uploading %.2f KB → s3://%s/%s", layer_tag, kb, AWS_BUCKET_NAME, s3_key)
@@ -676,13 +680,13 @@ GOLD_COLUMNS_TO_DROP = [
     "uri_format_valid",
     "has_data_quality_flag",
     "lesion_status_code",
-    "ehr_system",
 ]
 
 GOLD_COLUMN_ORDER = [
     "subject_surrogate_id",
     "age",
     "site_location",
+    "ehr_system",
     "enrollment_year",
     "lesion_label",
     "lesion_code_requires_review",
@@ -877,10 +881,19 @@ def run_pipeline() -> dict:
         log.info("[GOLD] Cohort summary written to UC table: %s", UC_GOLD_SUMMARY)
 
         metrics["gold_rows"] = gold_row_count
+        # metrics["gold_flagged_for_review"] = gold_df.filter(
+        #     F.col("lesion_code_requires_review") == True
+        # ).count()
+
+        log.info("!!! DEBUG !!! Available columns in gold_df: %s", gold_df.columns)
+
         metrics["gold_flagged_for_review"] = gold_df.filter(
             F.col("lesion_code_requires_review") == True
         ).count()
+
+
         gold_uris = write_gold_to_s3(gold_df, cohort_summary_df)
+        log.info("DEBUG: Available columns in gold_df: %s", gold_df.columns)
         metrics["gold_s3_uris"] = gold_uris
         log.info("GOLD LAYER COMPLETE")
     except Exception as exc:
