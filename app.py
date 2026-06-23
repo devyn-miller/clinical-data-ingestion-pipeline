@@ -1,6 +1,7 @@
-import requests
 import os
 import io
+import requests
+import time
 from datetime import datetime
 
 import boto3
@@ -24,6 +25,10 @@ def _setting(env_name: str, secret_section: str | None = None, secret_key: str |
 BRONZE_BUCKET = _setting("BRONZE_BUCKET_NAME", "aws", "bronze_bucket", "choc-rady-clinical-bronze-demo")
 AWS_REGION = _setting("AWS_REGION", "aws", "region", "us-west-2")
 RAW_PREFIX = _setting("BRONZE_RAW_PREFIX", default="raw")
+
+AWS_ACCESS_KEY_ID = _setting("AWS_ACCESS_KEY_ID", "aws", "aws_access_key_id", "")
+AWS_SECRET_ACCESS_KEY = _setting("AWS_SECRET_ACCESS_KEY", "aws", "aws_secret_access_key", "")
+
 DATABRICKS_WORKSPACE = _setting("DATABRICKS_WORKSPACE_URL", "databricks", "workspace_url", "")
 DATABRICKS_TOKEN = _setting("DATABRICKS_PERSONAL_ACCESS_TOKEN", "databricks", "token", "")
 DATABRICKS_JOB_ID = _setting("DATABRICKS_JOB_ID", "databricks", "job_id", "")
@@ -44,7 +49,12 @@ def upload_to_bronze(file_obj: io.BytesIO, filename: str, dataset_type: str, sub
     
     key = f"{RAW_PREFIX}/{object_prefix}/{unique_filename}"
 
-    client = boto3.client("s3", region_name=AWS_REGION)
+    client_kwargs = {"region_name": AWS_REGION}
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        client_kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+        client_kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+
+    client = boto3.client("s3", **client_kwargs)
     client.upload_fileobj(
         file_obj,
         BRONZE_BUCKET,
@@ -167,7 +177,12 @@ with tab2:
     st.subheader("Live S3 Bronze Landing Contents")
     if st.button("Scan S3 Bronze Bucket"):
         try:
-            s3_client = boto3.client("s3", region_name=AWS_REGION)
+            client_kwargs = {"region_name": AWS_REGION}
+            if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+                client_kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+                client_kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+
+            s3_client = boto3.client("s3", **client_kwargs)
             paginator = s3_client.get_paginator("list_objects_v2")
             objects = []
             for page in paginator.paginate(Bucket=BRONZE_BUCKET, Prefix=RAW_PREFIX):
