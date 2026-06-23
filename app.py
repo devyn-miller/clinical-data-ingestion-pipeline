@@ -302,7 +302,7 @@ with tab2:
     # Live s3 bucket listing
     st.subheader("Live S3 Bronze Landing Contents")
     if st.button("Scan S3 Bronze Bucket"):
-       try:
+        try:
             client_kwargs = {"region_name": AWS_REGION}
             if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
                 client_kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
