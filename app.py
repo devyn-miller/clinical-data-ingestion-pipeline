@@ -32,7 +32,34 @@ AWS_SECRET_ACCESS_KEY = _setting("AWS_SECRET_ACCESS_KEY", "aws", "aws_secret_acc
 DATABRICKS_WORKSPACE = _setting("DATABRICKS_WORKSPACE_URL", "databricks", "workspace_url", "")
 DATABRICKS_TOKEN = _setting("DATABRICKS_PERSONAL_ACCESS_TOKEN", "databricks", "token", "")
 DATABRICKS_JOB_ID = _setting("DATABRICKS_JOB_ID", "databricks", "job_id", "")
+# Place this diagnostic block right underneath your page title configurations in app.py
+st.sidebar.subheader("🔑 Live Cloud Secrets Status")
 
+if "aws" in st.secrets:
+    st.sidebar.success("✅ [aws] configuration found!")
+    
+    # Check key existence dynamically (safe Boolean status flags)
+    has_bucket = "bronze_bucket" in st.secrets["aws"]
+    has_key = "aws_access_key_id" in st.secrets["aws"]
+    has_secret = "aws_secret_access_key" in st.secrets["aws"]
+    
+    st.sidebar.write(f"• Bucket loaded: `{has_bucket}`")
+    st.sidebar.write(f"• IAM Key loaded: `{has_key}`")
+    st.sidebar.write(f"• IAM Secret loaded: `{has_secret}`")
+else:
+    st.sidebar.error("❌ [aws] section not found in Streamlit settings!")
+
+if "databricks" in st.secrets:
+    st.sidebar.success("✅ [databricks] configuration found!")
+    has_url = "workspace_url" in st.secrets["databricks"]
+    has_token = "token" in st.secrets["databricks"]
+    has_job = "job_id" in st.secrets["databricks"]
+    
+    st.sidebar.write(f"• Workspace URL loaded: `{has_url}`")
+    st.sidebar.write(f"• Orchestration Token: `{has_token}`")
+    st.sidebar.write(f"• Job ID: `{has_job}`")
+else:
+    st.sidebar.warning("⚠️ [databricks] parameters not configured. Auto-triggering bypassed.")
 
 def upload_to_bronze(file_obj: io.BytesIO, filename: str, dataset_type: str, submitter: str, affil: str) -> str:
     """Stream-pointer safe S3 Object storage uploading with unique timestamps and metadata."""
