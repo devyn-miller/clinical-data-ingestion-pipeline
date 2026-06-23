@@ -113,7 +113,7 @@ with tab1:
         raw_bytes = uploaded_file.getvalue()
         preview_df = pd.read_csv(io.BytesIO(raw_bytes))
         st.write("**Clinical Data Preview (First 5 Rows):**")
-       st.dataframe(preview_df.head())
+        st.dataframe(preview_df.head())
 
         if st.button("Upload & Trigger Pipeline", type="primary"):
             if not submitter_name:
