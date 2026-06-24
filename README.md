@@ -295,16 +295,6 @@ def test_apply_lesion_harmonization(spark):
     assert results[3] == "Lesion Detected"     # Positive Lesion
 ```
 
-The resulting `patient_id` is a deterministic 256-bit hash of the original SSN. The ML team can track longitudinal patient records by `patient_id` across scans, but the mapping from `patient_id` back to a real identity is computationally infeasible without the original SSN and a reverse-lookup table, neither of which exists in the Gold zone or is accessible to model training infrastructure.
-
-**Step 2) PHI column drop:**
-
-```python
-PHI_COLUMNS = ["ssn", "patient_name", "date_of_birth", "mrn", "address"]
-
-gold_df = anonymized_df.drop(*PHI_COLUMNS)
-```
-
 This lightweight architecture enables robust CI/CD pre-commit verification in seconds without requiring live cloud cluster connectivity or JVM overhead.
 
 ---
@@ -331,7 +321,7 @@ cd clinical-data-ingestion-pipeline
 pip install -r requirements.txt
 ```
 
-The `requirements.txt` includes: `streamlit`, `boto3`, `pyspark`, `pytest`, `pandas`, `pyarrow`.
+The `requirements.txt` includes: `streamlit`, `boto3`, `pandas`, `numpy`, `pyspark`, `pytest`, and `requests`.
 
 
 ### Step 1) Generate Synthetic Clinical Data
@@ -389,12 +379,13 @@ clinical-data-ingestion-pipeline/
 │
 ├── databricks/
 │   └── medallion_pipeline.py     # Core PySpark Medallion engine (Bronze, Silver, Gold layers)
-
+│
 ├── tests/
 │   └── test_pipeline.py          # Pytest suite validating EHR harmonization rules
 │
 └── data/
-    └── raw/                      # Local staging directory for generated mock files
+    ├── metadata.csv              # Generated synthetic Cerner/Epic records
+    └── dicom_manifest.csv        # Generated synthetic DICOM pointers
 ```
 
 ---
