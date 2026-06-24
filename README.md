@@ -17,9 +17,8 @@ The system is designed around a **hybrid decoupled ingest pattern**: a stateless
 4. [Deep-Dive Technical Highlights](#4-deep-dive-technical-highlights)
    - [Serverless Compute Constraint Resolution](#41-serverless-compute-constraint-resolution)
    - [EHR Schema Standardization and Harmonization](#42-ehr-schema-standardization-and-harmonization)
-   - [Window Function Deduplication Across Hospital Networks](#43-window-function-deduplication-across-hospital-networks)
-   - [AST-Parsed Local Testing Framework](#44-ast-parsed-local-testing-framework)
-   - [HIPAA Safe Harbor De-identification](#45-hipaa-safe-harbor-de-identification)
+   - [Cryptographic Surrogate Key Generation & Date Generalization](#43-cryptographic-surrogate-key-generation--date-generalization)
+   - [Modular Testing Framework & Graceful Schema Drift Handling](#44-modular-testing-framework--graceful-schema-drift-handling)
 5. [Deployment and Local Run Guide](#5-deployment-and-local-run-guide)
 6. [Repository Structure](#6-repository-structure)
 
@@ -33,38 +32,38 @@ The architecture enforces a strict separation of concerns between ingestion, tra
 flowchart TD
     subgraph INGESTION ["Decoupled Ingestion Layer (Zero Cluster Cost)"]
         A["Hospital Coordinator\nStreamlit UI\napp.py"]
-        B["boto3 Stream Pointer\nMemory-Safe Upload\nNo Full File Materialization"]
+        B["boto3 Stream Write\nMemory-Safe Upload\nTimestamped S3 Object Keys"]
     end
 
     subgraph STORAGE_RAW ["AWS S3 — Raw Landing Zone"]
-        C["s3://&lt;bucket&gt;/raw/\nImmutable, Timestamped\nfilename_YYYYMMDDTHHMMSSZ.csv"]
+        C["s3://&lt;bucket&gt;/raw/metadata/\ns3://&lt;bucket&gt;/raw/dicom/\nfilename_YYYYMMDDTHHMMSSZ.csv"]
     end
 
-    subgraph ORCHESTRATION ["Databricks Workflow Job (Scheduled / Manual Trigger)"]
-        D["Databricks Workflow Job\nWorkspace Repo Path:\nmedallion_pipeline.py"]
-        E["Driver Node\nboto3 Sync\nRaw S3 → /data\n(UC Serverless Sandbox Bypass)"]
+    subgraph ORCHESTRATION ["Databricks Workflow Job (REST API / Manual Trigger)"]
+        D["Databricks Job Trigger\nWorkspace Repo Path:\ndatabricks/medallion_pipeline.py"]
+        E["Driver Node boto3 Sync\nRaw S3 → Local /data\n(UC Serverless Sandbox Bypass)"]
     end
 
     subgraph COMPUTE ["PySpark Medallion Engine"]
-        F["Bronze Layer\nType Standardization\nAudit Metadata Tags\nPartitioned by pipeline_run_date"]
-        G["Silver Layer\nEHR Schema Harmonization\nCerner + Epic Code Unification\nWindow Deduplication by SSN\nPartitioned by site_location"]
-        H["Gold Layer\nSHA-256 PHI Anonymization\nPHI Column Drop\nFlat Parquet Export"]
+        F["Bronze Layer\nRaw Schema Enforced (participant_id)\nAudit Tags: ingested_at, source_file\nPartitioned by pipeline_run_date"]
+        G["Silver Layer\nEHR Schema Harmonization (Cerner vs Epic)\nLesion Labeling & Quality Review Flags\nInner Join by participant_id\nPartitioned by site_location"]
+        H["Gold Layer\nSHA-256 Surrogate Masking (16-char hex)\nEnrollment Year Generalization\nInternal Audit Column Purge"]
     end
 
     subgraph DELIVERY ["ML Delivery / S3 Gold Zone"]
-        I["gold/research_dataset/\nAnonymized Parquet\npatient_id hash + lesion_label\n+ scan_date + dicom_s3_path"]
-        J["gold/cohort_summary/\nAggregate Statistics\nfor IRB Reporting"]
+        I["gold/research_dataset/\nFlat Parquet Export\n10 ML Features (surrogate_id, age,\nlesion_label, s3_dicom_path...)"]
+        J["gold/cohort_summary/\nAggregate Demographic & IRB Benchmarks"]
     end
 
     K["Computer Vision Team\nBrain Lesion Segmentation\nModel Training"]
 
-    A -->|"Direct S3 write\nskips cluster entirely"| B
+    A -->|"Direct S3 write via boto3\nskips cluster compute entirely"| B
     B --> C
-    C -->|"Job trigger\n(scheduled or manual)"| D
+    C -->|"REST API POST trigger\nor manual workspace run"| D
     D --> E
     E -->|"SparkSession.read.csv"| F
-    F -->|"Harmonize + Deduplicate"| G
-    G -->|"De-identify + Export"| H
+    F -->|"Cleanse + Harmonize + Join"| G
+    G -->|"Anonymize + Generalize + Export"| H
     H --> I
     H --> J
     I --> K
@@ -74,12 +73,12 @@ flowchart TD
 **Key architectural properties enforced by this design:**
 
 | Property | Mechanism |
-|---|---|
-| Decoupled Ingress | Streamlit writes to S3 via `boto3`; Databricks cluster is never invoked by the UI |
-| Idempotency | Bronze layer writes to a single `pipeline_run_date` partition; reruns overwrite that partition only |
-| Partition Pruning | Silver partitioned by `site_location`; downstream queries skip irrelevant hospital partitions at the storage layer |
-| HIPAA Safe Harbor | SHA-256 surrogate keys replace SSN; all remaining PHI dropped before Gold write |
-| Immutable Raw | Timestamped filenames in `raw/` prevent overwrites regardless of how many times a coordinator re-uploads |
+| --- | --- |
+| **Decoupled Ingress** | Streamlit writes to S3 via `boto3`; Databricks cluster is never invoked during interactive UI uploads. |
+| **Idempotency** | Bronze tables partition by `pipeline_run_date`; historical raw loads remain isolated and safely reproducible. |
+| **Partition Pruning** | Silver layer partitions by `site_location`; downstream queries eliminate irrelevant hospital partitions at the storage layer. |
+| **Safe Harbor Alignment** | Deterministic SHA-256 surrogate keys replace raw identifiers (`participant_id`); dates generalize to admission years. |
+| **Immutable Landing** | UTC timestamp suffixes (`YYYYMMDDTHHMMSSZ`) ensure zero file overwriting across repeated coordinator uploads. |
 
 ---
 
@@ -126,52 +125,52 @@ flowchart TD
     A4 -.->|"Coordinator hands ID to IT\nor attaches to IRB submission"| B1
 ```
 
-The Ingestion Confirmation ID serves as the system's audit token. It ties a specific coordinator action to a specific set of rows in the pipeline and provides a traceable chain from raw upload through to the anonymized Gold output (a requirement for IRB audit trails and clinical operations accountability).
-
+1. **Clinician Upload Portal (`Tab 1`):** Hospital coordinators select their affiliation network (CHOC or Rady), attach clinical CSV extracts or DICOM manifests, and submit. The application standardizes raw column headers, generates an MD5 cryptographic audit token (e.g., `TX-C38A12`), pushes the payload directly to the AWS S3 Bronze landing zone, and triggers the Databricks cluster via REST API POST requests.
+2. **Internal Pipeline Monitor (`Tab 2`):** System administrators and data engineers can inspect S3 storage metrics, review directory schemas, and utilize the **Medallion Lineage Inspector**. By inputting a Confirmation ID, engineers can dynamically audit how heterogeneous hospital records transition across Bronze ingestion ledgers, Silver harmonized joins, and Gold anonymized ML research exports.
 ---
 
 ## 3. S3 Partitioning and Directory Layout
 
-The bucket layout encodes the pipeline's governance model in the filesystem itself. Partition strategy, immutability, and data sensitivity decrease as zones progress from `raw/` to `gold/`.
+The AWS S3 bucket layout reflects the pipeline's data governance and access control boundaries. Immutability decreases while data refinement and anonymization increase as records advance from `raw/` to `gold/`.
 
 ```
 s3://<bucket-name>/
 │
 ├── raw/
-│   ├── choc_patients_20260620T091500Z.csv        # Immutable, timestamped, never modified post-write.
-│   ├── choc_patients_20260621T143022Z.csv        # Re-uploads generate new files; no overwrite possible.
-│   ├── rady_patients_20260620T102300Z.csv
-│   └── rady_dicom_manifest_20260621T080011Z.csv
+│   ├── metadata/
+│   │   └── clinical_trial_batch_001_20260623T131804Z.csv   # Immutable raw landing; timestamp-suffixed.
+│   └── dicom/
+│       └── dicom_manifest_20260623T140000Z.csv             # Separate landing prefix for imaging pointers.
 │
 ├── bronze/
-│   └── pipeline_run_date=2026-06-23/             # Hive-style partition; single partition per run date.
-│       ├── part-00000-<uuid>.snappy.parquet       # Idempotent: reruns overwrite this partition only.
-│       └── part-00001-<uuid>.snappy.parquet       # Appends ingested_at, source_file, pipeline_run_date.
-│
+│   ├── metadata/
+│   │   └── pipeline_run_date=2026-06-23/                   # Hive-partitioned by pipeline execution date.
+│   │       └── part-0000.snappy.parquet                    # Preserves raw schema + audit lineage tags.
+│   └── dicom_manifest/
+│       └── pipeline_run_date=2026-06-23/
+│           └── part-0000.snappy.parquet
+
 ├── silver/
 │   └── clinical_imaging_joined/
-│       ├── site_location=CHOC/                   # Partition pruning: CHOC queries skip Rady entirely.
-│       │   ├── part-00000-<uuid>.snappy.parquet
-│       │   └── part-00001-<uuid>.snappy.parquet
-│       └── site_location=RADY/                   # Harmonized, deduplicated, DICOM-joined records.
-│           ├── part-00000-<uuid>.snappy.parquet
-│           └── part-00001-<uuid>.snappy.parquet
-│
+│       ├── site_location=CHOC/                             # Partition pruning: CHOC queries skip Rady entirely.
+│       │   └── part-0000.snappy.parquet
+│       └── site_location=RADY/                             # Cleansed, harmonized, and joined on participant_id.
+│           └── part-0000.snappy.parquet
+││
 └── gold/
-    ├── research_dataset/                         # Flat, unpartitioned. ML team reads full dataset.
-    │   ├── part-00000-<uuid>.snappy.parquet       # Columns: patient_id (hash), lesion_label,
-    │   └── part-00001-<uuid>.snappy.parquet       #          scan_date, dicom_s3_path. Zero PHI.
-    └── cohort_summary/                           # Aggregate statistics for IRB reporting.
-        └── part-00000-<uuid>.snappy.parquet       # Site-level counts, lesion prevalence, date ranges.
+    ├── research_dataset/                                   # Flat, unpartitioned Parquet export for ML ingestion.
+    │   └── part-0000.snappy.parquet                        # Retains exactly 10 anonymized clinical features.
+    └── cohort_summary/
+        └── part-0000.snappy.parquet                        # Aggregate demographic statistics for IRB compliance reporting.
+
 ```
 
 **Partitioning rationale by layer:**
 
-`bronze/pipeline_run_date=YYYY-MM-DD/` is partitioned by execution date to enable idempotent reruns. A failed job at 2:00 AM and a manual rerun at 9:00 AM on the same date produce identical output in the same partition. No duplicate accumulation occurs across retries.
+* `bronze/<dataset>/pipeline_run_date=YYYY-MM-DD/` is partitioned by execution date to guarantee idempotent batch runs. Rerunning a pipeline job overwrites the target run date partition without accumulating duplicate historical rows.
+* `silver/clinical_imaging_joined/site_location=<SITE>/` is partitioned by hospital site to enable storage-level partition pruning. When downstream researchers or computer vision models filter by a specific medical center, the Spark query planner eliminates irrelevant site folders before reading file blocks.
+* `gold/research_dataset/` is unpartitioned. Because the final research dataset represents a highly condensed, focused feature export designed for sequential in-memory batch shuffling during Deep Learning model training, maintaining a flat structure avoids unnecessary partition metadata overhead.
 
-`silver/clinical_imaging_joined/site_location=SITE/` is partitioned by hospital site to enable partition pruning on all downstream reads. When the computer vision team or a downstream analyst filters by site, the Spark query planner eliminates irrelevant partitions before any file is opened. At scale across years of data, this is the difference between scanning terabytes and scanning gigabytes.
-
-`gold/research_dataset/` is intentionally unpartitioned. The Gold dataset is the final ML delivery artifact: small, flat, anonymized, and designed for full-scan sequential reads by model training jobs. Partitioning a flat export this size adds metadata overhead without pruning benefit.
 
 ---
 
@@ -179,154 +178,121 @@ s3://<bucket-name>/
 
 ### 4.1 Serverless Compute Constraint Resolution
 
-Databricks Unity Catalog Serverless compute imposes two restrictions that are non-obvious until encountered in a live cluster environment:
+Databricks Unity Catalog Serverless compute environments enforce restricted JVM sandbox policies where standard DBFS S3 mounts (`dbutils.fs.mount`) are blocked entirely. To read local staged payloads reliably on Serverless compute without init script modifications, the pipeline executes an automated `boto3` synchronization on the driver node at job startup (`sync_s3_to_local_workspace`).
 
-1. `dbutils.fs.mount()`: standard DBFS S3 mounting is blocked entirely in the Serverless sandbox.
-2. Direct writes to `file:/tmp` on the driver node are restricted by the JVM sandbox policy.
-
-These restrictions render the conventional approach to reading local staged files inoperable on Serverless. The pipeline resolves this by executing a `boto3` sync on the driver node at job startup (before any Spark operation runs) by pulling raw staging files from `s3://bucket/raw/` into the local `/data` directory. This bypasses the DBFS mount restriction entirely and gives the PySpark reader a clean local path.
 
 ```python
 import boto3
 import os
 
-s3 = boto3.client("s3")
+s3_client = boto3.client("s3")
 os.makedirs("/data", exist_ok=True)
 
-paginator = s3.get_paginator("list_objects_v2")
-for page in paginator.paginate(Bucket=BUCKET_NAME, Prefix="raw/"):
+paginator = s3_client.get_paginator("list_objects_v2")
+pages = paginator.paginate(Bucket=AWS_BUCKET_NAME, Prefix="raw")
+
+for page in pages:
     for obj in page.get("Contents", []):
-        key = obj["Key"]
-        local_path = f"/data/{os.path.basename(key)}"
-        s3.download_file(BUCKET_NAME, key, local_path)
+        s3_key = obj["Key"]
+        if not s3_key.endswith("/"):
+            relative_key = s3_key[len("raw"):].lstrip("/")
+            local_dest = os.path.join("/data", relative_key)
+            os.makedirs(os.path.dirname(local_dest), exist_ok=True)
+            s3_client.download_file(AWS_BUCKET_NAME, s3_key, local_dest)
 ```
 
-This pattern is a deliberate architectural decision. The driver-side sync is fast, stateless, and idempotent. It requires no persistent DBFS mount configuration, no workspace-level permission escalation, and no modification to cluster init scripts.
+This stateless pre-flight step securely pulls raw S3 landing keys into the driver's local `/data` volume, providing the PySpark CSV readers with clean, highly performant local file paths.
 
 ---
 
 ### 4.2 EHR Schema Standardization and Harmonization
 
-CHOC operates on a Cerner EHR database, and Rady Children's Hospital operates on Epic. Each vendor encodes clinical findings using its own internal schema conventions, producing the following divergence for the `lesion_detected` field alone:
+CHOC utilizes Cerner EHR databases, whereas Rady Children's Hospital operates on Epic. Each software vendor encodes diagnostic findings under divergent conventions. For example, raw lesion classifications present the following split:
 
-| Hospital | EHR System | Negative Finding | Positive Finding |
-|---|---|---|---|
-| CHOC | Cerner | `-1` (integer) | `1` (integer) |
-| Rady | Epic | `NA` (string) or `None` (null) | `Positive` (string) |
+| Hospital Network | EHR Vendor Database | Negative / Clear Finding | Positive Lesion Finding |
+| --- | --- | --- | --- |
+| **CHOC** | Cerner | `-1` (String Integer) | `1` (String Integer) |
+| **Rady Children's** | Epic | `NA` or `None` (String / Null) | `Positive` (String) |
 
-A model ingesting the raw Silver join without harmonization would encounter four distinct representations of two clinical facts. Label encoding would produce four classes where two exist. The Silver harmonization step enforces a canonical vocabulary before any downstream consumer touches the data.
-
-```python
-from pyspark.sql import functions as F
-
-harmonized_df = joined_df.withColumn(
-    "lesion_label",
-    F.when(
-        F.col("lesion_detected").isin(["-1", "NA", "None"]) |
-        F.col("lesion_detected").isNull(),
-        F.lit("No Lesion Detected")
-    ).when(
-        F.col("lesion_detected").isin(["1", "Positive"]),
-        F.lit("Lesion Detected")
-    ).otherwise(F.lit("Unknown"))
-)
-```
-
-The `otherwise` catch maps any value outside the known vocabulary to `"Unknown"` rather than silently dropping rows. This surfaces schema drift from either EHR vendor in the output rather than allowing it to disappear into a filtered rowcount.
-
----
-
-### 4.3 Window Function Deduplication Across Hospital Networks
-
-A pediatric patient presenting at both CHOC and Rady within the same diagnostic period will generate records in both source datasets. A naive inner join on patient identifiers produces a Cartesian artifact: two rows for one patient, each carrying a different scan date and DICOM path. Including both in the Gold training dataset introduces label duplication and inflates apparent cohort size.
-
-The Silver layer resolves this using a PySpark Window function that partitions by patient SSN and selects only the most recent scan per patient across all sites:
+Without alignment, downstream label encoders would interpret four distinct classes for a binary clinical fact. The Silver layer resolves this via PySpark conditional harmonization (`apply_lesion_harmonization`), mapping findings into canonical vocabulary:
 
 ```python
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
-dedup_window = Window.partitionBy("ssn").orderBy(F.col("scan_date").desc())
+DIRTY_LESION_VALUES = {"-1", "NA", "na", "N/A", "n/a", "none", "None", ""}
+POSITIVE_LESION_VALUES = {"1", "positive", "Positive", "POSITIVE"}
 
-deduplicated_df = (
-    joined_df
-    .withColumn("row_num", F.row_number().over(dedup_window))
-    .filter(F.col("row_num") == 1)
-    .drop("row_num")
-)
-```
+def apply_lesion_harmonization(df, col_name="lesion_status_code"):
+    normalized = F.lower(F.trim(F.col(col_name)))
+    is_null_or_empty = F.col(col_name).isNull() | (F.trim(F.col(col_name)) == "")
+    is_dirty = normalized.isin([v.lower() for v in DIRTY_LESION_VALUES if v != ""])
+    is_positive = normalized.isin([v.lower() for v in POSITIVE_LESION_VALUES])
 
-The ordering by `scan_date` descending guarantees that the retained row always reflects the patient's most recent clinical imaging event, regardless of which hospital generated it. The Gold output therefore contains exactly one row per unique patient: the most diagnostically current record available across the full hospital network.
-
----
-
-### 4.4 AST-Parsed Local Testing Framework
-
-Standard Python module imports fail on Databricks notebooks because notebooks contain structural cells that are not valid Python syntax: `%pip install` magic commands and `# COMMAND ----------` cell delimiters interrupt the parser before any function definition is reached.
-
-The test suite resolves this through Abstract Syntax Tree parsing. Rather than importing the notebook as a module, the test file reads the raw notebook source as a string, walks the AST to locate the target function definition by name, compiles that isolated node into a code object, and executes it into a controlled namespace. This produces a callable Python function with no notebook scaffolding attached.
-
-```python
-import ast
-import types
-import pytest
-
-NOTEBOOK_PATH = "medallion_pipeline.py"
-TARGET_FUNCTION = "apply_lesion_harmonization"
-
-def extract_function_from_notebook(notebook_path: str, function_name: str) -> types.FunctionType:
-    with open(notebook_path, "r") as f:
-        source = f.read()
-
-    # Strip Databricks cell delimiters before parsing
-    cleaned = "\n".join(
-        line for line in source.splitlines()
-        if not line.strip().startswith("%") and "# COMMAND ----------" not in line
+    lesion_label = (
+        F.when(is_null_or_empty | is_dirty, F.lit("No Lesion Detected"))
+        .when(is_positive, F.lit("Lesion Detected"))
+        .otherwise(F.lit("Pending Radiologist Review"))
     )
-
-    tree = ast.parse(cleaned)
-    namespace = {}
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == function_name:
-            module_node = ast.Module(body=[node], type_ignores=[])
-            code = compile(module_node, filename=notebook_path, mode="exec")
-            exec(code, namespace)
-            return namespace[function_name]
-
-    raise ValueError(f"Function '{function_name}' not found in {notebook_path}")
-
-
-apply_lesion_harmonization = extract_function_from_notebook(NOTEBOOK_PATH, TARGET_FUNCTION)
-
-
-@pytest.mark.parametrize("raw_value,expected", [
-    ("-1",       "No Lesion Detected"),
-    ("NA",       "No Lesion Detected"),
-    ("None",     "No Lesion Detected"),
-    (None,       "No Lesion Detected"),
-    ("1",        "Lesion Detected"),
-    ("Positive", "Lesion Detected"),
-])
-def test_lesion_harmonization(raw_value, expected):
-    assert apply_lesion_harmonization(raw_value) == expected
+    return (
+        df.withColumn("lesion_label", lesion_label)
+        .withColumn("lesion_code_requires_review", (~(is_null_or_empty | is_dirty | is_positive)).cast("boolean"))
+    )
 ```
 
-This enables sub-second test execution on a local machine with no cloud dependency, no JVM startup cost, and no live Databricks cluster required. The full suite of 25 tests completes in under 30 seconds in a headless local Spark session. Any schema drift introduced by either EHR vendor is caught at commit time rather than at pipeline execution time.
+Unrecognized schema variants trigger `lesion_code_requires_review = True`, surfacing vendor schema drift explicitly in data quality audit tables rather than dropping unmapped patient encounters.
 
 ---
 
-### 4.5 HIPAA Safe Harbor De-identification
+### 4.3 Cryptographic Surrogate Key Generation & Date Generalization
 
-The Gold layer is the delivery boundary for the ML team. No record that crosses into `gold/` may contain any of the 18 HIPAA Safe Harbor identifiers. The de-identification step in the pipeline enforces this through two sequential operations:
+To satisfy HIPAA Safe Harbor de-identification standards (45 CFR §164.514(b)) and IRB compliance requirements, records advancing into the Gold research zone undergo strict anonymization:
 
-**Step 1) Surrogate key generation via SHA-256:**
+**1. Deterministic SHA-256 Surrogate Key Masking:**
 
 ```python
-anonymized_df = silver_df.withColumn(
-    "patient_id",
-    F.sha2(F.col("ssn").cast("string"), 256)
-)
+def mask_participant_id(df, id_col="participant_id"):
+    return df.withColumn(
+        "subject_surrogate_id",
+        F.substring(F.sha2(F.col(id_col), 256), 1, 16)
+    ).drop(id_col)
+```
+
+Raw identifiers (`P001`) are hashed into irreversible 16-character hexadecimal strings. The computer vision team can track longitudinal scan sequences per surrogate subject, but reversing the hash back to an unmasked identity is computationally impossible within the ML environment.
+
+**2. Date Precision Reduction & Audit Purging:**
+
+
+```python
+def reduce_date_precision(df, date_col="enrollment_date"):
+    return df.withColumn("enrollment_year", F.year(F.col(date_col))).drop(date_col)
+```
+
+Exact admission dates are generalized to enrollment years, and internal audit tags (`ingested_at`, `source_file`) are explicitly purged. The final Gold ML delivery table exposes exactly 10 robust research features: `subject_surrogate_id`, `age`, `site_location`, `ehr_system`, `enrollment_year`, `lesion_label`, `lesion_code_requires_review`, `imaging_s3_uri`, `modality`, and `body_region`.
+
+---
+
+### 4.4 Modular Testing Framework & Graceful Schema Drift Handling
+
+The transformation engine separates core PySpark mapping logic into modular, testable Python definitions. The unit testing suite (`tests/test_pipeline.py`) natively imports transformation functions from `databricks.medallion_pipeline` to validate cross-EHR harmonization rules inside a local, headless PySpark session:
+
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType
+from databricks.medallion_pipeline import apply_lesion_harmonization
+
+def test_apply_lesion_harmonization(spark):
+    schema = StructType([StructField("raw_code", StringType(), True)])
+    df = spark.createDataFrame([("-1",), ("NA",), (None,), ("1",)], schema)
+    
+    result_df = apply_lesion_harmonization(df, "raw_code")
+    results = [row["lesion_label"] for row in result_df.collect()]
+    
+    assert results[0] == "No Lesion Detected"  # Cerner Negative
+    assert results[1] == "No Lesion Detected"  # Epic Negative
+    assert results[2] == "No Lesion Detected"  # Null handling
+    assert results[3] == "Lesion Detected"     # Positive Lesion
 ```
 
 The resulting `patient_id` is a deterministic 256-bit hash of the original SSN. The ML team can track longitudinal patient records by `patient_id` across scans, but the mapping from `patient_id` back to a real identity is computationally infeasible without the original SSN and a reverse-lookup table, neither of which exists in the Gold zone or is accessible to model training infrastructure.
@@ -339,7 +305,7 @@ PHI_COLUMNS = ["ssn", "patient_name", "date_of_birth", "mrn", "address"]
 gold_df = anonymized_df.drop(*PHI_COLUMNS)
 ```
 
-The explicit drop step is not redundant given the hash. It ensures that no downstream query, schema inspection, or accidental `SELECT *` can surface raw identifiers — even from a node with direct S3 access. The Gold schema contains exactly four columns: `patient_id`, `lesion_label`, `scan_date`, and `dicom_s3_path`.
+This lightweight architecture enables robust CI/CD pre-commit verification in seconds without requiring live cloud cluster connectivity or JVM overhead.
 
 ---
 
@@ -350,7 +316,7 @@ The explicit drop step is not redundant given the hash. It ensures that no downs
 - Python 3.10+
 - Apache Spark 3.4+ (local mode for testing)
 - A free AWS account with S3 read/write credentials configured via `~/.aws/credentials` or environment variables
-- A free Databricks Community Edition account with a workspace containing a configured Workflow Job pointing to `medallion_pipeline.py`
+- A free Databricks Community Edition account with a Databricks Workspace URL and Personal Access Token configured in environment or Streamlit secrets
 
 ### Clone the repository
 
@@ -367,81 +333,65 @@ pip install -r requirements.txt
 
 The `requirements.txt` includes: `streamlit`, `boto3`, `pyspark`, `pytest`, `pandas`, `pyarrow`.
 
-### Step 1) Generate synthetic clinical data
+
+### Step 1) Generate Synthetic Clinical Data
 
 ```bash
-python generate_mock_data.py
+python generate_data.py
+
 ```
 
-This script writes two synthetic patient CSV files to `./data/raw/`:
-- `choc_patients_<timestamp>.csv` — Cerner-schema records with integer lesion codes
-- `rady_patients_<timestamp>.csv` — Epic-schema records with string lesion codes
+This utility generates 500 synthetic patient records across Cerner and Epic coding conventions, saving `metadata.csv` and `dicom_manifest.csv` directly into the `./data/` directory.
 
-It also generates a synthetic `dicom_manifest_<timestamp>.csv` mapping patient SSNs to mock S3 DICOM paths.
-
-### Step 2) Upload synthetic files to S3 raw landing zone
+### Step 2) Run the Local Unit Test Suite
 
 ```bash
-python upload_to_s3.py --bucket <your-bucket-name> --prefix raw/
+pytest tests/test_pipeline.py -v
+
 ```
 
-Or use the Streamlit portal (Step 3) to upload files interactively as a hospital coordinator would.
+Expected output:
 
-### Step 3) Launch the Streamlit ingestion portal
+```text
+tests/test_pipeline.py::test_apply_lesion_harmonization PASSED
+```
+
+The test suite validates the cross-EHR PySpark harmonization logic entirely within a local, headless Spark session. No active cloud cluster connectivity or Databricks environment is required.
+
+### Step 3) Launch the Streamlit Ingestion Portal
 
 ```bash
 streamlit run app.py
 ```
 
-Navigate to `http://localhost:8501`. Use the **Clinician Upload** tab to upload a file and receive an Ingestion Confirmation ID. Use the **IT System Monitor** tab to paste that ID into the Medallion Lineage Inspector and trace the record's transformation across Bronze, Silver, and Gold.
+Navigate to `http://localhost:8501`. Use the **Clinician Upload Portal** tab to upload data extracts and receive a unique Ingestion Confirmation ID. Switch over to the **Internal Pipeline Monitor** tab to paste that ID into the Medallion Schema Lineage & Transformation Inspector to inspect how records transition across Bronze, Silver, and Gold schemas.
 
-### Step 4) Run the local unit test suite
+### Step 4) Trigger the Databricks Medallion Pipeline
 
-```bash
-pytest tests/test_pipeline.py -v
-```
+Within your Databricks Workspace UI, navigate to **Workflows**, select the configured workspace job pointing to `databricks/medallion_pipeline.py`, and click **Run now**. The execution job will perform the following steps:
 
-Expected output:
+1. **S3 Workspace Sync:** Execute a driver-side `boto3` pagination loop to pull newest staging files from `s3://<bucket>/raw/` into the local cluster `/data` volume, bypassing Unity Catalog Serverless mounting restrictions.
+2. **Bronze Ingestion:** Apply strict primitive structural definitions on read, append lineage audit markers (`ingested_at`, `source_file`), and write historical snapshots partitioned by `pipeline_run_date`.
+3. **Silver Harmonization & Join:** Map inconsistent Cerner and Epic findings into a unified clinical classification space, perform data quality checks, and inner-join manifests on `participant_id`, writing outputs partitioned by `site_location`.
+4. **Gold Anonymization:** Replace raw candidate keys with deterministic 16-character SHA-256 surrogate strings, drop internal audit keys, reduce date precision to enrollment years, and export flat, ML-ready Parquet datasets.
 
-```
-tests/test_pipeline.py::test_lesion_harmonization[-1-No Lesion Detected] PASSED
-tests/test_pipeline.py::test_lesion_harmonization[NA-No Lesion Detected] PASSED
-tests/test_pipeline.py::test_lesion_harmonization[None-No Lesion Detected] PASSED
-tests/test_pipeline.py::test_lesion_harmonization[none_val-No Lesion Detected] PASSED
-tests/test_pipeline.py::test_lesion_harmonization[1-Lesion Detected] PASSED
-tests/test_pipeline.py::test_lesion_harmonization[Positive-Lesion Detected] PASSED
-...
-25 passed in 18.43s
-```
+All transformation phases log precise row counts, data profiling distributions, and S3 destination endpoints directly to the stdout run tracker stream.
 
-The test suite executes entirely in a local, headless Spark session. No Databricks cluster is required.
-
-### Step 5) Trigger the Databricks Medallion pipeline
-
-In the Databricks UI, navigate to **Workflows** and open the `clinical-medallion-pipeline` job. Click **Run now**. The job will:
-
-1. Execute the `boto3` driver-side sync to pull files from `s3://bucket/raw/` into `/data`
-2. Execute the Bronze standardization and partition write to `s3://bucket/bronze/pipeline_run_date=<today>/`
-3. Execute the Silver harmonization, deduplication, and DICOM join, writing to `s3://bucket/silver/clinical_imaging_joined/`
-4. Execute the Gold de-identification and PHI drop, writing final Parquet to `s3://bucket/gold/research_dataset/` and `s3://bucket/gold/cohort_summary/`
-
-All four steps log row counts, partition paths, and write confirmation to the Databricks run output stream.
-
----
 
 ## 6. Repository Structure
 
 ```
 clinical-data-ingestion-pipeline/
 │
-├── app.py                        # Streamlit RBAC portal — clinician upload + IT monitor tabs
-├── medallion_pipeline.py         # Databricks PySpark notebook — Bronze, Silver, Gold layers
-├── generate_mock_data.py         # Synthetic data generator — Cerner + Epic schema variants
-├── upload_to_s3.py               # CLI utility for direct S3 raw-zone uploads
-├── requirements.txt
+├── app.py                        # Streamlit RBAC portal — clinician upload + internal monitor tabs
+├── generate_data.py              # Synthetic clinical data generator (Cerner & Epic EHR variants)
+├── requirements.txt              # Package dependencies (including pyarrow for Parquet serialization)
 │
+├── databricks/
+│   └── medallion_pipeline.py     # Core PySpark Medallion engine (Bronze, Silver, Gold layers)
+
 ├── tests/
-│   └── test_pipeline.py          # Pytest suite with AST-parsed function extraction
+│   └── test_pipeline.py          # Pytest suite validating EHR harmonization rules
 │
 └── data/
     └── raw/                      # Local staging directory for generated mock files
@@ -457,15 +407,17 @@ clinical-data-ingestion-pipeline/
 | Cloud Storage | AWS S3 (Hive-partitioned Parquet) |
 | Orchestration | Databricks Workflow Jobs |
 | Compute Engine | Apache Spark 3.4 (PySpark), Databricks Serverless |
-| Testing | Pytest, Python AST module, PySpark local mode |
+| Testing | Pytest, Modular imports, PySpark local mode |
 | De-identification | SHA-256 via PySpark `F.sha2` |
 | Data Format | CSV (ingest), Snappy-compressed Parquet (output) |
+
+
 
 ---
 
 ## Compliance and Governance
 
-This pipeline was designed to satisfy the requirements of HIPAA Safe Harbor de-identification (45 CFR §164.514(b)) and IRB data governance protocols applicable to pediatric clinical research. The Gold layer contains no direct identifiers as defined by the Safe Harbor method. Surrogate key generation is performed within the compute boundary and the original SSN column is dropped prior to any write operation. Raw data in the `raw/` prefix is accessible only to credentialed pipeline service accounts and is never exposed to the ML delivery layer.
+This platform enforces data anonymization principles aligned with HIPAA Safe Harbor de-identification standards (45 CFR §164.514(b)). Raw patient identifiers (`participant_id`) are cryptographically masked using deterministic SHA-256 surrogate keys within the compute boundary, and exact admission dates are generalized to enrollment years prior to ML export. The raw landing prefix (`raw/`) is restricted to automated service accounts and remains isolated from downstream model training infrastructure.
 
 ---
 
