@@ -108,11 +108,11 @@ flowchart TD
         end
 
         subgraph SILVER_VIEW ["Silver View"]
-            B4["Harmonized schema row\nlesion_label: Lesion Detected\nssn preserved for deduplication key\nDICOM path joined"]
+            B4["Harmonized schema row\nlesion_label: Lesion Detected\nparticipant_id preserved for inner join\nDICOM path joined"]
         end
 
         subgraph GOLD_VIEW ["Gold View"]
-            B5["Anonymized output row\npatient_id: sha256 hash\nssn DROPPED  dob DROPPED\nname DROPPED"]
+            B5["Anonymized output row\nsurrogate_id: sha256 hash\nparticipant_id DROPPED\ninternal audit tags DROPPED"]
         end
 
         B6["Simulated Execution Log Panel\nStep-by-step pipeline status\nBronze write confirmation\nSilver dedup row counts\nGold PHI audit confirmation"]
