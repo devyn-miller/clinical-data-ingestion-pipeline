@@ -159,7 +159,7 @@ s3://<bucket-name>/
 ││
 └── gold/
     ├── research_dataset/                                   # Flat, unpartitioned Parquet export for ML ingestion.
-    │   └── part-0000.snappy.parquet                        # Retains exactly 10 anonymized clinical features.
+    │   └── part-0000.snappy.parquet                        # Retains anonymized clinical features.
     └── cohort_summary/
         └── part-0000.snappy.parquet                        # Aggregate demographic statistics for IRB compliance reporting.
 
@@ -321,7 +321,7 @@ cd clinical-data-ingestion-pipeline
 pip install -r requirements.txt
 ```
 
-The `requirements.txt` includes: `streamlit`, `boto3`, `pandas`, `numpy`, `pyspark`, `pytest`, and `requests`.
+The `requirements.txt` includes: `streamlit`, `boto3`, `pandas`, `numpy`, `pyspark`, `pytest`, `pyarrow`, and `requests`.
 
 
 ### Step 1) Generate Synthetic Clinical Data
