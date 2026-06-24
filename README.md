@@ -29,41 +29,52 @@ The system is designed around a **hybrid decoupled ingest pattern**: a stateless
 The architecture enforces a strict separation of concerns between ingestion, transformation, and delivery. The Streamlit portal and the Databricks compute cluster share only a storage contract: the S3 raw landing prefix, and nothing else. Cluster compute does not spin up during UI interactions, and the UI does not poll or depend on cluster state.
 
 ```mermaid
-flowchart TD
-    subgraph INGESTION ["Decoupled Ingestion Layer (Zero Cluster Cost)"]
-        A["Hospital Coordinator\nStreamlit UI\napp.py"]
-        B["boto3 Stream Write\nMemory-Safe Upload\nTimestamped S3 Object Keys"]
+flowchart LR
+    %% Custom Styles & Color Palette
+    classDef Ingestion fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef Storage fill:#ECEFF1,stroke:#455A64,stroke-width:2px,color:#263238;
+    classDef Compute fill:#FFF3E0,stroke:#E65100,stroke-width:2px,color:#E65100;
+    classDef Bronze fill:#D7CCC8,stroke:#5D4037,stroke-width:2px,color:#4E342E;
+    classDef Silver fill:#CFD8DC,stroke:#37474F,stroke-width:2px,color:#263238;
+    classDef Gold fill:#FFF9C4,stroke:#FBC02D,stroke-width:2px,color:#F57F17;
+    classDef Delivery fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef Consumer fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+
+    %% Row 1: Collection & Storage Boundary
+    subgraph ROW_ONE ["Ingestion & Raw Landing Zone"]
+        A["Hospital Coordinator UI<br/><i>Streamlit (app.py)</i>"]:::Ingestion
+        B["Memory-Safe Upload<br/><i>boto3 Stream Write</i>"]:::Ingestion
+        C[("AWS S3 Raw Storage<br/><i>s3://raw-bucket/</i>")]:::Storage
     end
 
-    subgraph STORAGE_RAW ["AWS S3 — Raw Landing Zone"]
-        C["s3://&lt;bucket&gt;/raw/metadata/\ns3://&lt;bucket&gt;/raw/dicom/\nfilename_YYYYMMDDTHHMMSSZ.csv"]
+    %% Row 2: Ingestion Logic to Orchestration
+    subgraph ROW_TWO ["Orchestration & Compute "]
+        D["Job Trigger Engine<br/><i>REST API / Manual</i>"]:::Compute
+        E["Driver Node boto3 Sync<br/><i>Raw S3 to Local /data</i>"]:::Compute
     end
 
-    subgraph ORCHESTRATION ["Databricks Workflow Job (REST API / Manual Trigger)"]
-        D["Databricks Job Trigger\nWorkspace Repo Path:\ndatabricks/medallion_pipeline.py"]
-        E["Driver Node boto3 Sync\nRaw S3 → Local /data\n(UC Serverless Sandbox Bypass)"]
+    %% Row 3: PySpark Medallion Grid
+    subgraph ROW_THREE ["PySpark Medallion Pipeline"]
+        F[("Bronze Layer<br/>• Schema Enforced<br/>• Audit Tags Added")]:::Bronze
+        G[("Silver Layer<br/>• EHR Harmonization<br/>• Quality Flags")]:::Silver
+        H[("Gold Layer<br/>• SHA-256 Masking<br/>• Column Purge")]:::Gold
     end
 
-    subgraph COMPUTE ["PySpark Medallion Engine"]
-        F["Bronze Layer\nRaw Schema Enforced (participant_id)\nAudit Tags: ingested_at, source_file\nPartitioned by pipeline_run_date"]
-        G["Silver Layer\nEHR Schema Harmonization (Cerner vs Epic)\nLesion Labeling & Quality Review Flags\nInner Join by participant_id\nPartitioned by site_location"]
-        H["Gold Layer\nSHA-256 Surrogate Masking (16-char hex)\nEnrollment Year Generalization\nInternal Audit Column Purge"]
+    %% Row 4: Final Deliverables & Consumers
+    subgraph ROW_FOUR ["Data Delivery & Analytics"]
+        I[("gold/research_dataset/<br/><i>Flat Parquet Export</i>")]:::Delivery
+        J[("gold/cohort_summary/<br/><i>IRB Benchmarks</i>")]:::Delivery
+        K["Computer Vision Team<br/><i>Model Training Pipeline</i>"]:::Consumer
     end
 
-    subgraph DELIVERY ["ML Delivery / S3 Gold Zone"]
-        I["gold/research_dataset/\nFlat Parquet Export\n10 ML Features (surrogate_id, age,\nlesion_label, s3_dicom_path...)"]
-        J["gold/cohort_summary/\nAggregate Demographic & IRB Benchmarks"]
-    end
-
-    K["Computer Vision Team\nBrain Lesion Segmentation\nModel Training"]
-
-    A -->|"Direct S3 write via boto3\nskips cluster compute entirely"| B
+    %% Structural Grid Routing
+    A --> B
     B --> C
-    C -->|"REST API POST trigger\nor manual workspace run"| D
+    C --> D
     D --> E
-    E -->|"SparkSession.read.csv"| F
-    F -->|"Cleanse + Harmonize + Join"| G
-    G -->|"Anonymize + Generalize + Export"| H
+    E --> F
+    F --> G
+    G --> H
     H --> I
     H --> J
     I --> K
