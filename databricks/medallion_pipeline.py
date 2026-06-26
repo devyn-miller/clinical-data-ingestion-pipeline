@@ -447,16 +447,16 @@ def sync_s3_to_local_workspace() -> None:
 
 # Schemas
 METADATA_RAW_SCHEMA = StructType([
-    StructField("participant_id",    StringType(), nullable=False),
+    StructField("ssn",    StringType(), nullable=False),
     StructField("age",               StringType(), nullable=True),
     StructField("site_location",     StringType(), nullable=True),
     StructField("ehr_system",        StringType(), nullable=True),
     StructField("lesion_status_code",StringType(), nullable=True),
-    StructField("enrollment_date",   StringType(), nullable=True),
+    StructField("scan_date",   StringType(), nullable=True),
 ])
 
 DICOM_RAW_SCHEMA = StructType([
-    StructField("participant_id", StringType(), nullable=False),
+    StructField("ssn", StringType(), nullable=False),
     StructField("dicom_s3_uri",   StringType(), nullable=True),
     StructField("modality",       StringType(), nullable=True),
     StructField("body_region",    StringType(), nullable=True),
@@ -528,11 +528,11 @@ def ingest_bronze(
     log.info("[BRONZE] %s; Written to UC table: %s", layer_name, uc_table)
     return bronze_df
 
-def deduplicate_patients(df: DataFrame, partition_col: str = "participant_id", order_col: str = "enrollment_date") -> DataFrame:
+def deduplicate_patients(df: DataFrame, partition_col: str = "ssn", order_col: str = "scan_date") -> DataFrame:
     """
     Resolves multi-site patient duplicates by keeping only the most recent clinical record.
     Instantiates a PySpark Window partitioned by the participant ID and ordered by the 
-    enrollment date descending.
+    scan date descending.
     """
     # Create the window specification
     window_spec = Window.partitionBy(partition_col).orderBy(F.col(order_col).desc())
@@ -612,16 +612,16 @@ def clean_metadata(df: DataFrame) -> DataFrame:
     """Clean, standardize, and type-cast metadata records."""
     log.info("[SILVER] Cleaning metadata; %d raw rows", df.count())
 
-    df = df.filter(F.col("participant_id").isNotNull())
+    df = df.filter(F.col("ssn").isNotNull())
 
-    for col in ["participant_id", "site_location", "ehr_system",
-                "lesion_status_code", "enrollment_date"]:
+    for col in ["ssn", "site_location", "ehr_system",
+                "lesion_status_code", "scan_date"]:
         df = df.withColumn(col, F.trim(F.col(col)))
 
     df = (
         df
         .withColumn("age",             F.col("age").cast(IntegerType()))
-        .withColumn("enrollment_date", F.to_date(F.col("enrollment_date"), "yyyy-MM-dd"))
+        .withColumn("scan_date", F.to_date(F.col("scan_date"), "yyyy-MM-dd"))
         .withColumn("site_location",   F.upper(F.col("site_location")))
     )
 
@@ -629,7 +629,7 @@ def clean_metadata(df: DataFrame) -> DataFrame:
 
     df = df.withColumn(
         "has_data_quality_flag",
-        (F.col("age").isNull() | F.col("enrollment_date").isNull()).cast("boolean"),
+        (F.col("age").isNull() | F.col("scan_date").isNull()).cast("boolean"),
     )
 
     # Single aggregation pass instead of 4 separate .count() actions
@@ -654,7 +654,7 @@ def clean_dicom(df: DataFrame) -> DataFrame:
     log.info("[SILVER] Cleaning DICOM manifest; %d raw rows", df.count())
 
     df = df.filter(
-        F.col("participant_id").isNotNull() & F.col("dicom_s3_uri").isNotNull()
+        F.col("ssn").isNotNull() & F.col("dicom_s3_uri").isNotNull()
     )
     df = df.withColumn("modality",    F.upper(F.initcap(F.trim(F.col("modality")))))
     df = df.withColumn("body_region", F.initcap(F.trim(F.col("body_region"))))
@@ -675,7 +675,7 @@ def clean_dicom(df: DataFrame) -> DataFrame:
 
 
 
-def mask_participant_id(df: DataFrame, id_col: str = "participant_id") -> DataFrame:
+def mask_ssn(df: DataFrame, id_col: str = "ssn") -> DataFrame:
     """Replace participant IDs with deterministic SHA-256 surrogate keys."""
     return df.withColumn(
         "subject_surrogate_id",
@@ -683,8 +683,8 @@ def mask_participant_id(df: DataFrame, id_col: str = "participant_id") -> DataFr
     ).drop(id_col)
 
 
-def reduce_date_precision(df: DataFrame, date_col: str = "enrollment_date") -> DataFrame:
-    """Convert enrollment dates to enrollment years."""
+def reduce_date_precision(df: DataFrame, date_col: str = "scan_date") -> DataFrame:
+    """Convert scan dates to enrollment years."""
     return df.withColumn(
         "enrollment_year", F.year(F.col(date_col))
     ).drop(date_col)
@@ -782,18 +782,18 @@ def run_pipeline() -> dict:
         silver_metadata_df = deduplicate_patients(silver_metadata_df)
         log.info("[SILVER] Deduplication dropped %d stale cross-EHR records", pre_dedup_count - silver_metadata_df.count())
 
-        pre_join_meta_ids = silver_metadata_df.select("participant_id").distinct().count()
-        pre_join_dicom_ids = silver_dicom_df.select("participant_id").distinct().count()
+        pre_join_meta_ids = silver_metadata_df.select("ssn").distinct().count()
+        pre_join_dicom_ids = silver_dicom_df.select("ssn").distinct().count()
 
         silver_joined_df = silver_metadata_df.join(
             silver_dicom_df.select(
-                "participant_id",
+                "ssn",
                 F.col("dicom_s3_uri").alias("imaging_s3_uri"),
                 "modality",
                 "body_region",
                 "uri_format_valid",
             ),
-            on="participant_id",
+            on="ssn",
             how="inner",
         )
 
@@ -834,7 +834,7 @@ def run_pipeline() -> dict:
     log.info("GOLD LAYER BEGINNING")
     log.info("=" * 70)
     try:
-        gold_df = mask_participant_id(silver_joined_df)
+        gold_df = mask_ssn(silver_joined_df)
         gold_df = reduce_date_precision(gold_df)
         gold_df = gold_df.drop(*[c for c in GOLD_COLUMNS_TO_DROP if c in gold_df.columns])
 
@@ -932,8 +932,8 @@ def run_pipeline() -> dict:
     log.info("Gold output rows       : %d", metrics["gold_rows"])
     log.info("Gold flagged for review: %d", metrics["gold_flagged_for_review"])
     log.info("Lesion governance      : Applied (Cerner/Epic cross-EHR code harmonization)")
-    log.info("PII masking            : participant_id → SHA-256 surrogate (16-char hex prefix)")
-    log.info("Date reduction         : enrollment_date → enrollment_year")
+    log.info("PII masking            : ssn → SHA-256 surrogate (16-char hex prefix)")
+    log.info("Date reduction         : scan_date → enrollment_year")
     log.info("=" * 70)
     log.info("S3 OUTPUT LOCATIONS")
     log.info("=" * 70)

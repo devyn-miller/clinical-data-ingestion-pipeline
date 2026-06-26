@@ -88,7 +88,7 @@ flowchart LR
 | **Decoupled Ingress** | Streamlit writes to S3 via `boto3`; Databricks cluster is never invoked during interactive UI uploads. |
 | **Idempotency** | Bronze tables partition by `pipeline_run_date`; historical raw loads remain isolated and safely reproducible. |
 | **Partition Pruning** | Silver layer partitions by `site_location`; downstream queries eliminate irrelevant hospital partitions at the storage layer. |
-| **Safe Harbor Alignment** | Deterministic SHA-256 surrogate keys replace raw identifiers (`participant_id`); dates generalize to admission years. |
+| **Safe Harbor Alignment** | Deterministic SHA-256 surrogate keys replace raw identifiers (`ssn`); dates generalize to admission years. |
 | **Immutable Landing** | UTC timestamp suffixes (`YYYYMMDDTHHMMSSZ`) ensure zero file overwriting across repeated coordinator uploads. |
 
 ---
@@ -119,11 +119,11 @@ flowchart TD
         end
 
         subgraph SILVER_VIEW ["Silver View"]
-            B4["Harmonized schema row\nlesion_label: Lesion Detected\nparticipant_id preserved for inner join\nDICOM path joined"]
+            B4["Harmonized schema row\nlesion_label: Lesion Detected\nssn preserved for inner join\nDICOM path joined"]
         end
 
         subgraph GOLD_VIEW ["Gold View"]
-            B5["Anonymized output row\nsurrogate_id: sha256 hash\nparticipant_id DROPPED\ninternal audit tags DROPPED"]
+            B5["Anonymized output row\nsurrogate_id: sha256 hash\nssn DROPPED\ninternal audit tags DROPPED"]
         end
 
         B6["Simulated Execution Log Panel\nStep-by-step pipeline status\nBronze write confirmation\nSilver dedup row counts\nGold PHI audit confirmation"]
@@ -165,7 +165,7 @@ s3://<bucket-name>/
 │   └── clinical_imaging_joined/
 │       ├── site_location=CHOC/                             # Partition pruning: CHOC queries skip Rady entirely.
 │       │   └── part-0000.snappy.parquet
-│       └── site_location=RADY/                             # Cleansed, harmonized, and joined on participant_id.
+│       └── site_location=RADY/                             # Cleansed, harmonized, and joined on ssn.
 │           └── part-0000.snappy.parquet
 ││
 └── gold/
@@ -261,7 +261,7 @@ To satisfy HIPAA Safe Harbor de-identification standards (45 CFR §164.514(b)) a
 **1. Deterministic SHA-256 Surrogate Key Masking:**
 
 ```python
-def mask_participant_id(df, id_col="participant_id"):
+def mask_ssn(df, id_col="ssn"):
     return df.withColumn(
         "subject_surrogate_id",
         F.substring(F.sha2(F.col(id_col), 256), 1, 16)
@@ -274,7 +274,7 @@ Raw identifiers (`P001`) are hashed into irreversible 16-character hexadecimal s
 
 
 ```python
-def reduce_date_precision(df, date_col="enrollment_date"):
+def reduce_date_precision(df, date_col="scan_date"):
     return df.withColumn("enrollment_year", F.year(F.col(date_col))).drop(date_col)
 ```
 
@@ -373,7 +373,7 @@ Within your Databricks Workspace UI, navigate to **Workflows**, select the confi
 
 1. **S3 Workspace Sync:** Execute a driver-side `boto3` pagination loop to pull newest staging files from `s3://<bucket>/raw/` into the local cluster `/data` volume, bypassing Unity Catalog Serverless mounting restrictions.
 2. **Bronze Ingestion:** Apply strict primitive structural definitions on read, append lineage audit markers (`ingested_at`, `source_file`), and write historical snapshots partitioned by `pipeline_run_date`.
-3. **Silver Harmonization & Join:** Map inconsistent Cerner and Epic findings into a unified clinical classification space, perform data quality checks, and inner-join manifests on `participant_id`, writing outputs partitioned by `site_location`.
+3. **Silver Harmonization & Join:** Map inconsistent Cerner and Epic findings into a unified clinical classification space, perform data quality checks, and inner-join manifests on `ssn`, writing outputs partitioned by `site_location`.
 4. **Gold Anonymization:** Replace raw candidate keys with deterministic 16-character SHA-256 surrogate strings, drop internal audit keys, reduce date precision to enrollment years, and export flat, ML-ready Parquet datasets.
 
 All transformation phases log precise row counts, data profiling distributions, and S3 destination endpoints directly to the stdout run tracker stream.
@@ -419,7 +419,7 @@ clinical-data-ingestion-pipeline/
 
 ## Compliance and Governance
 
-This platform enforces data anonymization principles aligned with HIPAA Safe Harbor de-identification standards (45 CFR §164.514(b)). Raw patient identifiers (`participant_id`) are cryptographically masked using deterministic SHA-256 surrogate keys within the compute boundary, and exact admission dates are generalized to enrollment years prior to ML export. The raw landing prefix (`raw/`) is restricted to automated service accounts and remains isolated from downstream model training infrastructure.
+This platform enforces data anonymization principles aligned with HIPAA Safe Harbor de-identification standards (45 CFR §164.514(b)). Raw patient identifiers (`ssn`) are cryptographically masked using deterministic SHA-256 surrogate keys within the compute boundary, and exact admission dates are generalized to enrollment years prior to ML export. The raw landing prefix (`raw/`) is restricted to automated service accounts and remains isolated from downstream model training infrastructure.
 
 ---
 

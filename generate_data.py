@@ -41,9 +41,9 @@ def _random_date(year: int) -> str:
     delta = (end - start).days
     return (start + timedelta(days=random.randint(0, delta))).isoformat()
 
-def _build_participant_ids(n: int) -> list[str]:
+def _build_ssns(n: int) -> list[str]:
     """Generate zero-padded participant IDs."""
-    return [f"P{str(i).zfill(3)}" for i in range(1, n + 1)]
+    return [f"999-{str(random.randint(10, 99))}-{str(i).zfill(4)}" for i in range(1, n + 1)]
 
 def _inject_missing(series: pd.Series, rate: float) -> pd.Series:
     """Randomly replace a fraction of values with NaN."""
@@ -53,9 +53,9 @@ def _inject_missing(series: pd.Series, rate: float) -> pd.Series:
     series.loc[missing_indices] = np.nan
     return series
 
-def build_metadata(participant_ids: list[str]) -> pd.DataFrame:
+def build_metadata(ssns: list[str]) -> pd.DataFrame:
     """Build synthetic clinical metadata records."""
-    n = len(participant_ids)
+    n = len(ssns)
 
     site_location = np.random.choice(SITES, size=n, p=SITE_WEIGHTS)
     ehr_system = np.array([EHR_SYSTEM_MAP[s] for s in site_location])
@@ -70,12 +70,12 @@ def build_metadata(participant_ids: list[str]) -> pd.DataFrame:
 
     df = pd.DataFrame(
         {
-            "participant_id": participant_ids,
+            "ssn": ssns,
             "age": np.random.randint(5, 19, size=n),
             "site_location": site_location,
             "ehr_system": ehr_system,
             "lesion_status_code": lesion_status_code,
-            "enrollment_date": [_random_date(YEAR) for _ in range(n)],
+            "scan_date": [_random_date(YEAR) for _ in range(n)],
         }
     )
 
@@ -107,18 +107,18 @@ def build_metadata(participant_ids: list[str]) -> pd.DataFrame:
 
     return df
 
-def build_dicom_manifest(participant_ids: list[str]) -> pd.DataFrame:
+def build_dicom_manifest(ssns: list[str]) -> pd.DataFrame:
     """Build synthetic DICOM manifest records."""
-    n = len(participant_ids)
+    n = len(ssns)
 
     uris = [
         f"s3://choc-rady-clinical-bronze-demo/imaging/{pid}_scan1.dcm"
-        for pid in participant_ids
+        for pid in ssns
     ]
 
     df = pd.DataFrame(
         {
-            "participant_id": participant_ids,
+            "ssn": ssns,
             "dicom_s3_uri": uris,
             "modality": np.random.choice(MODALITIES, size=n),
             "body_region": BODY_REGION,
@@ -134,10 +134,10 @@ def main() -> None:
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    participant_ids = _build_participant_ids(N_PARTICIPANTS)
+    ssns = _build_ssns(N_PARTICIPANTS)
 
-    metadata_df = build_metadata(participant_ids)
-    dicom_df = build_dicom_manifest(participant_ids)
+    metadata_df = build_metadata(ssns)
+    dicom_df = build_dicom_manifest(ssns)
 
     metadata_path = os.path.join(OUTPUT_DIR, "metadata.csv")
     dicom_path = os.path.join(OUTPUT_DIR, "dicom_manifest.csv")

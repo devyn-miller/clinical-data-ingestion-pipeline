@@ -187,7 +187,7 @@ with tab1:
                         
                         # Harmonize columns names to standard names for trace pipeline
                         rename_map = {
-                            "cerner_id": "participant_id", "epic_id": "participant_id",
+                            "cerner_id": "ssn", "epic_id": "ssn",
                             "age_in_years": "age",
                             "scan_date": "scan_date", "mri_date": "scan_date",
                             "lesion_status_code": "raw_lesion_status", "lesion_status": "raw_lesion_status"
@@ -350,7 +350,7 @@ s3://{BRONZE_BUCKET}/
 
     # Stage 2: Bronze (Enforces structured columns & metadata)
     bronze_preview = source_df.copy()
-    bronze_preview.insert(0, "participant_id", [f"P{str(i).zfill(5)}" for i in range(len(bronze_preview))])
+    bronze_preview.insert(0, "ssn", [f"P{str(i).zfill(5)}" for i in range(len(bronze_preview))])
     bronze_preview["ingested_at"] = tx_record["timestamp"]
     bronze_preview["source_file"] = f"s3://{BRONZE_BUCKET}/raw/{tx_record['filename']}"
     bronze_preview["pipeline_run_date"] = datetime.now().strftime("%Y-%m-%d")
