@@ -9,6 +9,7 @@ import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from pyspark.sql.types import (
     StructType,
     StructField,
@@ -240,7 +241,6 @@ def _upload_pandas_to_s3(
     pdf_ready.attrs = {} 
     
     pdf_ready.to_parquet(buf, engine="pyarrow", index=False, compression="snappy")
-    # pdf.to_parquet(buf, engine="pyarrow", index=False, compression="snappy")
     buf.seek(0)
     kb = len(buf.getvalue()) / 1024
     log.info("[%s→S3] Uploading %.2f KB → s3://%s/%s", layer_tag, kb, AWS_BUCKET_NAME, s3_key)
@@ -528,6 +528,23 @@ def ingest_bronze(
     log.info("[BRONZE] %s; Written to UC table: %s", layer_name, uc_table)
     return bronze_df
 
+def deduplicate_patients(df: DataFrame, partition_col: str = "participant_id", order_col: str = "enrollment_date") -> DataFrame:
+    """
+    Resolves multi-site patient duplicates by keeping only the most recent clinical record.
+    Instantiates a PySpark Window partitioned by the participant ID and ordered by the 
+    enrollment date descending.
+    """
+    # Create the window specification
+    window_spec = Window.partitionBy(partition_col).orderBy(F.col(order_col).desc())
+    
+    # Assign a row number based on the window, keep only the first (newest) row, and drop the helper column
+    df_deduped = (
+        df.withColumn("row_num", F.row_number().over(window_spec))
+        .filter(F.col("row_num") == 1)
+        .drop("row_num")
+    )
+    
+    return df_deduped
 
 def _resolve_source_path(primary: str, fallback_dirs: list) -> str:
     """Return the first path that exists, fallback to recursively searched alternatives."""
@@ -760,6 +777,10 @@ def run_pipeline() -> dict:
     try:
         silver_metadata_df = clean_metadata(bronze_metadata_df)
         silver_dicom_df = clean_dicom(bronze_dicom_df)
+
+        pre_dedup_count = silver_metadata_df.count()
+        silver_metadata_df = deduplicate_patients(silver_metadata_df)
+        log.info("[SILVER] Deduplication dropped %d stale cross-EHR records", pre_dedup_count - silver_metadata_df.count())
 
         pre_join_meta_ids = silver_metadata_df.select("participant_id").distinct().count()
         pre_join_dicom_ids = silver_dicom_df.select("participant_id").distinct().count()
